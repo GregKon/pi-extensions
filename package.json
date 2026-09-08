@@ -1,12 +1,12 @@
 {
   "name": "pi-extensions",
-  "description": "GregKon's pi extensions: low-temp, notify, check_git_extensions",
+  "description": "GregKon's pi extensions: low-temp, notify, check_git_extensions, zones",
   "keywords": [
     "pi-package",
     "pi",
     "extension"
   ],
-  "version": "0.2.2",
+  "version": "0.3.0",
   "license": "MIT",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
