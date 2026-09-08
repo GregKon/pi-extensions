@@ -88,6 +88,10 @@ function latestTag(tags: string[]): string | undefined {
   return latest;
 }
 
+function looksLikeCommit(ref: string): boolean {
+  return /^[0-9a-f]{7,40}$/i.test(ref);
+}
+
 async function listRemoteTags(repo: string): Promise<string[]> {
   const url = `https://${repo}.git`;
   const output = await new Promise<string>((resolve, reject) => {
@@ -120,6 +124,14 @@ async function checkGitExtensions(): Promise<Report> {
     }
     try {
       const tags = await listRemoteTags(pkg.repo);
+      // Pin must exist as an actual tag (or be a commit SHA). A namespaced tag
+      // like "usage-extension/v0.9.4" does NOT satisfy a pin of "v0.9.4" — only
+      // comparing version numbers would report a false OK for a broken pin.
+      if (!tags.includes(pkg.ref) && !looksLikeCommit(pkg.ref)) {
+        rows.push(`- ${pkg.repo}: PIN NOT FOUND — tag "${pkg.ref}" doesn't exist on remote`);
+        errors++;
+        continue;
+      }
       const latest = latestTag(tags);
       if (!latest) {
         rows.push(`- ${pkg.repo}: no version tags found (pin: ${pkg.ref})`);
