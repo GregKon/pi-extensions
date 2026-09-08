@@ -92,6 +92,12 @@ function looksLikeCommit(ref: string): boolean {
   return /^[0-9a-f]{7,40}$/i.test(ref);
 }
 
+/** Namespace prefix of a ref: "raw-paste/v0.1.0" -> "raw-paste/", "v0.2.0" -> "". */
+function namespaceOf(ref: string): string {
+  const i = ref.lastIndexOf("/");
+  return i >= 0 ? ref.slice(0, i + 1) : "";
+}
+
 async function listRemoteTags(repo: string): Promise<string[]> {
   const url = `https://${repo}.git`;
   const output = await new Promise<string>((resolve, reject) => {
@@ -132,7 +138,13 @@ async function checkGitExtensions(): Promise<Report> {
         errors++;
         continue;
       }
-      const latest = latestTag(tags);
+      const latest = latestTag(
+        // Monorepos namespace tags per sub-project (e.g. "raw-paste/v0.1.0").
+        // Find the latest within the pin's own namespace, otherwise a higher
+        // version from another sub-project (e.g. "usage-extension/v0.9.4")
+        // yields a false NEWER.
+        tags.filter((t) => t.startsWith(namespaceOf(pkg.ref))),
+      );
       if (!latest) {
         rows.push(`- ${pkg.repo}: no version tags found (pin: ${pkg.ref})`);
         continue;
