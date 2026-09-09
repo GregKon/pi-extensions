@@ -9,9 +9,12 @@
  * Zone can be overridden by a file in the directory where pi was opened (cwd):
  *   .zonegreen / .zoneyellow / .zonered   (precedence: red > yellow > green)
  *
- * UI (option B): colored zone indicator as a widget above the editor. pi's own footer stays intact.
+ * UI: the zone is shown as a persistent, colored `setStatus` entry. pi's built-in
+ * footer renders extension statuses on a single line, sorted by key. The "zones" key
+ * sorts after "caveman"/"deepseek-peak", so the colored zone lands at the RIGHT end of
+ * that status line. No extra line, no footer replacement, colors via ANSI (theme.fg).
  *
- * Prompt gate — only at session start (also on /resume):
+ * Prompt gate — only at session start (also on /resume) and when the model changes:
  *   green  -> nothing
  *   yellow -> ask once: user must type "yes" before the prompt is sent
  *   red    -> ask twice
@@ -79,54 +82,61 @@ function modelLabel(
   return label;
 }
 
+interface ModelLike {
+  provider?: string;
+  id?: string;
+  name?: string;
+  reasoning?: boolean;
+}
+
 export default function (pi: ExtensionAPI) {
   // Session state — reset on every start (also /resume, /new, /fork).
   let gatePending = false;
   let cwd = "";
 
+  /** Refresh the persistent colored zone status in the footer. */
+  function updateStatus(ctx: { model?: unknown; thinkingLevel?: string }) {
+    const model = ctx.model as ModelLike | undefined;
+    if (!model) {
+      ctx.ui.setStatus("zones", undefined);
+      return;
+    }
+    const zone = computeZone(model.provider ?? "", model.id ?? "", model.name ?? "", cwd);
+    // Key "zones" sorts after "caveman"/"deepseek-peak" -> lands at the right end of the status line.
+    // Only the zone tag is shown; the model name already appears on the right side of the footer.
+    // Vivid+bold: theme "success" -> bazowy ANSI green (blady); bold podbija do bright green.
+    // Separator " | " oddziela zone-tag wyraznie od statusow innych extension.
+    ctx.ui.setStatus("zones", ctx.ui.theme.bold(ctx.ui.theme.fg(zoneColor(zone), ` | [zone ${zone}]`)));
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     cwd = ctx.cwd;
     gatePending = true;
-    updateWidget(ctx);
+    updateStatus(ctx);
   });
 
-  pi.on("model_select", async (_event, ctx) => {
-    updateWidget(ctx);
+  pi.on("model_select", async (event, ctx) => {
+    // Model change mid-session = zone change -> re-arm the gate and refresh the status.
+    const model = event.model as ModelLike | undefined;
+    if (model) {
+      const zone = computeZone(model.provider ?? "", model.id ?? "", model.name ?? "", cwd);
+      gatePending = zone !== "green";
+    }
+    updateStatus(ctx);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     gatePending = false;
+    ctx.ui.setStatus("zones", undefined);
   });
 
-  // Colored zone indicator above the editor (option B — pi's footer untouched).
-  function updateWidget(ctx: { model?: unknown; thinkingLevel?: string; mode?: string }) {
-    if (ctx.mode !== "tui") return;
-    const model = ctx.model as
-      | { provider?: string; id?: string; name?: string; reasoning?: boolean }
-      | undefined;
-    ctx.ui.setWidget("zones", (tui, theme) => {
-      let lines: string[] = [];
-      if (model) {
-        const provider = model.provider ?? "";
-        const id = model.id ?? "";
-        const name = model.name ?? "";
-        const zone = computeZone(provider, id, name, cwd);
-        const label = modelLabel(provider, id, name, ctx.thinkingLevel, model.reasoning);
-        lines = [theme.fg(zoneColor(zone), `[${zone}] ${label}`)];
-      }
-      return { render: () => lines, invalidate: () => {} };
-    });
-  }
-
-  // Prompt gate — only at session start, only interactively.
+  // Prompt gate — only at session start / on model change, only interactively.
   pi.on("input", async (event, ctx) => {
     if (ctx.mode !== "tui") return { action: "continue" };
     if (event.source !== "interactive") return { action: "continue" };
     if (!gatePending) return { action: "continue" };
 
-    const model = ctx.model as
-      | { provider?: string; id?: string; name?: string; reasoning?: boolean }
-      | undefined;
+    const model = ctx.model as ModelLike | undefined;
     if (!model) return { action: "continue" };
 
     const provider = model.provider ?? "";
@@ -167,9 +177,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("zone", {
     description: "Show current model zone (green/yellow/red) and override files",
     handler: async (_args, ctx) => {
-      const model = ctx.model as
-        | { provider?: string; id?: string; name?: string; reasoning?: boolean }
-        | undefined;
+      const model = ctx.model as ModelLike | undefined;
       if (!model) {
         ctx.ui.notify("No active model", "info");
         return;

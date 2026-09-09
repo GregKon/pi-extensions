@@ -1,0 +1,14 @@
+# Portability Linux + Windows: force LF in working copies on both platforms.
+# Windows core.autocrlf=true yields CRLF working copies, which breaks bash scripts
+# and silently eats purposeful CR sequences at commit time.
+# Extension sources (.ts) and shell scripts are always LF; binaries explicit.
+* text=auto
+*.sh   text eol=lf
+*.bash text eol=lf
+*.ts   text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.png  binary
+*.jpg  binary
+*.gif  binary
