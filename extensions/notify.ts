@@ -3,7 +3,7 @@
  *
  * Emits OSC 777 notification when Pi settles (finished work).
  * Title: session name (e.g. "extension")
- * Body: last 3 words of the last user prompt that triggered the run.
+ * Body: last 3 words of the last user prompt + date + run duration.
  *
  * Toggle: /notify on|off (default OFF, persisted in ~/.pi/agent/notify-config.json)
  *
@@ -19,6 +19,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "notify-config.json");
 
 let lastPrompt: string | undefined;
+let runStart: number | undefined;
+
+function fmtDur(ms: number): string {
+	if (ms < 1000) return `${ms}ms`;
+	const s = Math.round(ms / 1000);
+	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
+}
 
 function loadEnabled(): boolean {
 	try {
@@ -54,6 +61,10 @@ function notifyOSC777(title: string, body: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.on("agent_start", async () => {
+		runStart = Date.now();
+	});
+
 	pi.on("message_end", async (event) => {
 		if (event.message.role === "user") {
 			const text = getText(event.message);
@@ -67,6 +78,9 @@ export default function (pi: ExtensionAPI) {
 		const sessionName = pi.getSessionName() || "pi";
 		let body = lastPrompt ? lastWords(lastPrompt, 3) : "done";
 		const end = Date.now();
+		body += ` · ${new Date(end).toISOString().slice(0, 10)}`;
+		if (runStart !== undefined) body += ` · total ${fmtDur(end - runStart)}`;
+		runStart = undefined;
 
 		notifyOSC777(sessionName, body);
 	});
