@@ -6,7 +6,7 @@
     "pi",
     "extension"
   ],
-  "version": "0.3.4",
+  "version": "0.3.5",
   "license": "MIT",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

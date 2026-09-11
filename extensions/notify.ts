@@ -78,7 +78,7 @@ export default function (pi: ExtensionAPI) {
 		const sessionName = pi.getSessionName() || "pi";
 		let body = lastPrompt ? lastWords(lastPrompt, 3) : "done";
 		const end = Date.now();
-		body += ` · ${new Date(end).toISOString().slice(11, 19)}`;
+		body += ` · ${new Date(end).toLocaleTimeString("pl-PL", { hour12: false })}`;
 		if (runStart !== undefined) body += ` · total ${fmtDur(end - runStart)}`;
 		runStart = undefined;
 
