@@ -19,15 +19,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "notify-config.json");
 
 let lastPrompt: string | undefined;
-let runStart: number | undefined;
-let llmMs = 0;
-let lastMsgStart: number | undefined;
-
-function fmtDur(ms: number): string {
-	if (ms < 1000) return `${ms}ms`;
-	const s = Math.round(ms / 1000);
-	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
-}
 
 function loadEnabled(): boolean {
 	try {
@@ -63,21 +54,7 @@ function notifyOSC777(title: string, body: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.on("agent_start", async () => {
-		runStart = Date.now();
-		llmMs = 0;
-		lastMsgStart = undefined;
-	});
-
-	pi.on("message_start", async (event) => {
-		if (event.message.role === "assistant") lastMsgStart = Date.now();
-	});
-
 	pi.on("message_end", async (event) => {
-		if (event.message.role === "assistant" && lastMsgStart !== undefined) {
-			llmMs += Date.now() - lastMsgStart;
-			lastMsgStart = undefined;
-		}
 		if (event.message.role === "user") {
 			const text = getText(event.message);
 			if (text.trim()) lastPrompt = text;
@@ -90,9 +67,7 @@ export default function (pi: ExtensionAPI) {
 		const sessionName = pi.getSessionName() || "pi";
 		let body = lastPrompt ? lastWords(lastPrompt, 3) : "done";
 		const end = Date.now();
-		if (runStart !== undefined) {
-			body += ` · start ${new Date(runStart).toISOString().slice(11, 19)} · end ${new Date(end).toISOString().slice(11, 19)} · total ${fmtDur(end - runStart)} · llm ${fmtDur(llmMs)}`;
-		}
+
 		notifyOSC777(sessionName, body);
 	});
 
