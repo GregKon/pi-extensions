@@ -3,7 +3,7 @@
  *
  * Emits OSC 777 notification when Pi settles (finished work).
  * Title: session name (e.g. "extension")
- * Body: last 3 words of the last user prompt + date + run duration.
+ * Body: last 3 words of the last user prompt + time + run duration.
  *
  * Toggle: /notify on|off (default OFF, persisted in ~/.pi/agent/notify-config.json)
  *
@@ -78,7 +78,7 @@ export default function (pi: ExtensionAPI) {
 		const sessionName = pi.getSessionName() || "pi";
 		let body = lastPrompt ? lastWords(lastPrompt, 3) : "done";
 		const end = Date.now();
-		body += ` · ${new Date(end).toISOString().slice(0, 10)}`;
+		body += ` · ${new Date(end).toISOString().slice(11, 19)}`;
 		if (runStart !== undefined) body += ` · total ${fmtDur(end - runStart)}`;
 		runStart = undefined;
 
