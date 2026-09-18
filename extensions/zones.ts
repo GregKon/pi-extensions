@@ -3,6 +3,8 @@
  *
  * Zone = safety level of the active model:
  *   green  — local model: provider/model name contains 'local' (e.g. apiKey: "local")
+ *            OR the endpoint is loopback (127.0.0.0/8, localhost, ::1, 0.0.0.0) —
+ *            e.g. provider "llama-server=http://127.0.0.1:8082" / llama.cpp
  *   red    — model name contains 'free' OR provider is nvidia/google (they train on your data)
  *   yellow — everything else
  *
@@ -31,6 +33,14 @@ type Zone = "green" | "yellow" | "red";
 
 const RED_PROVIDERS = ["nvidia", "google"];
 
+/**
+ * Loopback endpoint — model runs on this machine (or a tunnel to it), data stays local.
+ * Anchored to a host position (start, after "//" or after "@") so that hostnames merely
+ * containing a dotted quad ("127.0.0.1.evil.com") are not treated as local.
+ */
+const LOOPBACK_HOST =
+  /(?:^|\/\/|@)(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|\[::1\]|::1|0\.0\.0\.0)(?::\d+)?(?=[/:?]|$)/;
+
 /** Precedence of zone override files in cwd: red > yellow > green. */
 function fileOverride(cwd: string): Zone | undefined {
   if (!cwd) return undefined;
@@ -41,13 +51,17 @@ function fileOverride(cwd: string): Zone | undefined {
 }
 
 /** Auto-detect zone from the model. */
-function autoZone(provider: string, id: string, name: string): Zone {
+function autoZone(provider: string, id: string, name: string, baseUrl: string): Zone {
   const p = (provider || "").toLowerCase();
   const i = (id || "").toLowerCase();
   const n = (name || "").toLowerCase();
 
   // green: local model — 'local' in provider/model name (apiKey: "local")
   if (p.includes("local") || i.includes("local") || n.includes("local")) return "green";
+
+  // green: loopback endpoint — llama.cpp / llama-server / any self-hosted server.
+  // The provider id itself may carry the URL ("llama-server=http://127.0.0.1:8082").
+  if (LOOPBACK_HOST.test(p) || LOOPBACK_HOST.test((baseUrl || "").toLowerCase())) return "green";
 
   // red: 'free' in the name, or provider is nvidia/google
   if (i.includes("free") || n.includes("free")) return "red";
@@ -57,8 +71,14 @@ function autoZone(provider: string, id: string, name: string): Zone {
   return "yellow";
 }
 
-function computeZone(provider: string, id: string, name: string, cwd: string): Zone {
-  return fileOverride(cwd) ?? autoZone(provider, id, name);
+function computeZone(
+  provider: string,
+  id: string,
+  name: string,
+  baseUrl: string,
+  cwd: string,
+): Zone {
+  return fileOverride(cwd) ?? autoZone(provider, id, name, baseUrl);
 }
 
 // --- opencode-go monthly limits ---
@@ -192,6 +212,7 @@ interface ModelLike {
   provider?: string;
   id?: string;
   name?: string;
+  baseUrl?: string;
   reasoning?: boolean;
 }
 
@@ -259,7 +280,13 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("zones", undefined);
       return;
     }
-    const zone = computeZone(model.provider ?? "", model.id ?? "", model.name ?? "", cwd);
+    const zone = computeZone(
+      model.provider ?? "",
+      model.id ?? "",
+      model.name ?? "",
+      model.baseUrl ?? "",
+      cwd,
+    );
     // Key "zones" sorts after "caveman"/"deepseek-peak" -> lands at the right end of the status line.
     // Only the zone tag is shown; the model name already appears on the right side of the footer.
     // Vivid+bold: theme "success" -> bazowy ANSI green (blady); bold podbija do bright green.
@@ -284,7 +311,13 @@ export default function (pi: ExtensionAPI) {
     // Model change mid-session = zone change -> re-arm the gate and refresh the status.
     const model = event.model as ModelLike | undefined;
     if (model) {
-      const zone = computeZone(model.provider ?? "", model.id ?? "", model.name ?? "", cwd);
+      const zone = computeZone(
+        model.provider ?? "",
+        model.id ?? "",
+        model.name ?? "",
+        model.baseUrl ?? "",
+        cwd,
+      );
       gatePending = zone !== "green";
     }
     updateStatus(ctx);
@@ -307,7 +340,7 @@ export default function (pi: ExtensionAPI) {
     const provider = model.provider ?? "";
     const id = model.id ?? "";
     const name = model.name ?? "";
-    const zone = computeZone(provider, id, name, cwd);
+    const zone = computeZone(provider, id, name, model.baseUrl ?? "", cwd);
 
     // green -> no question
     if (zone === "green") {
@@ -347,7 +380,13 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("No active model", "info");
         return;
       }
-      const zone = computeZone(model.provider ?? "", model.id ?? "", model.name ?? "", cwd);
+      const zone = computeZone(
+        model.provider ?? "",
+        model.id ?? "",
+        model.name ?? "",
+        model.baseUrl ?? "",
+        cwd,
+      );
       const label = modelLabel(
         model.provider ?? "",
         model.id ?? "",
