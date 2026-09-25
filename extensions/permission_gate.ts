@@ -43,8 +43,10 @@ const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const BLOCK = `## Shell and permissions
 \`read\`/\`edit\`/\`write\`/\`grep\`/\`find\`/\`ls\` are never gated — use them instead of shell
 equivalents (\`cat\`, \`awk\`, \`python -c\`, \`node -e\`). Some shell commands need approval: the
-user gets a dialog. If a task needs more than you have, say so in text — never chain
-commands to slip past a prompt.`;
+user gets a dialog. A bash call is graded by its worst segment: \`;\`, \`&&\`, \`|\` and
+\`$(...)\` split it, and unknown commands default to high — so one \`python -c\` or a
+substitution gates an otherwise read-only chain; give such a step its own call. Need more than
+the current level? Say so in text — never chain commands to slip past a prompt.`;
 
 interface GateConfig {
   threshold: Level;
