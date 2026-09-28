@@ -117,11 +117,11 @@ export default function (pi: ExtensionAPI) {
     gatePending = config.gate && LEVELS.indexOf(level) > LEVELS.indexOf(config.threshold);
     if (!ctx.hasUI) return;
     if (drift) {
-      ctx.ui.notify(`permission_gate: pi-hooks ${drift} — sprawdź założenia (permission_gate.ts)`, "warning");
+      ctx.ui.notify(`permission_gate: pi-hooks ${drift} — re-check the assumptions (permission_gate.ts)`, "warning");
       ctx.ui.setStatus("permgate", " | [pi-hooks?]");
     }
     if (gatePending) {
-      ctx.ui.notify(`permission_gate: poziom ${level} — potwierdź pierwszy prompt`, "warning");
+      ctx.ui.notify(`permission_gate: level ${level} — confirm the first prompt`, "warning");
     }
   });
 

@@ -325,7 +325,7 @@ export default function (pi: ExtensionAPI) {
       .filter((m): m is ModelLike => !!m && modelLocal(m))
       .map((m) => `${m.provider ?? "?"}/${m.id ?? "?"}`);
     if (names.length > 0) return names.join(", ");
-    return "sprawdź listę przez /model (scopedModels puste bez skonfigurowanego scope)";
+    return "check the list via /model (scopedModels is empty without a configured scope)";
   }
 
   function localOnlyWhy(model: ModelLike | undefined, ctx: CtxLike): string {
@@ -334,8 +334,8 @@ export default function (pi: ExtensionAPI) {
     // `/model` only exists in TUI; print/json get --model, rpc has its own set_model call.
     const how = ctx.mode === "tui" ? "/model" : ctx.mode === "rpc" ? "set_model (RPC)" : "--model";
     return localOnly
-      ? `zones: .zonelocal (${localOnlyAt}) — model ${id} nie jest loopback (adres: ${addr}). `
-        + `Wybierz model lokalny przez ${how}. Lokalne w tej sesji: ${localModelsList(ctx)}`
+      ? `zones: .zonelocal (${localOnlyAt}) — model ${id} is not loopback (address: ${addr}). `
+        + `Pick a local model via ${how}. Local models in this session: ${localModelsList(ctx)}`
       : "";
   }
 
@@ -357,7 +357,7 @@ export default function (pi: ExtensionAPI) {
   /** Reason on stderr, written synchronously — console.error to a pipe can be lost on exit. */
   function sayRefused(why: string): void {
     try {
-      writeSync(2, `${why}\n[zones] przebieg nieinteraktywny w katalogu z .zonelocal — nic nie zostało wysłane do modelu.\n`);
+      writeSync(2, `${why}\n[zones] non-interactive run in a .zonelocal directory — nothing was sent to the model.\n`);
     } catch {
       /* stderr closed */
     }
@@ -398,7 +398,7 @@ export default function (pi: ExtensionAPI) {
     if (!localOnly) return;
     const model = (ctx as { model?: ModelLike }).model;
     if (modelLocal(model)) return;
-    const why = `${localOnlyWhy(model, ctx)} Kompresja do modela spoza loopback odrzucona.`;
+    const why = `${localOnlyWhy(model, ctx)} Compaction to a non-loopback model refused.`;
     if ((ctx as { mode?: string }).mode === "tui") {
       try {
         ctx.ui?.notify?.(why, "error");
@@ -630,8 +630,8 @@ export default function (pi: ExtensionAPI) {
         .filter((z) => existsSync(join(cwd, `.zone${z}`)))
         .join(", ");
       const localInfo = localOnly
-        ? ` | local-only: ${localOnlyAt} (${localOnlyKind}; szukane w roocie ${findRepoRoot(cwd)}; `
-          + `${modelLocal(model) ? "model OK" : "model ODRZUCONY"})`
+        ? ` | local-only: ${localOnlyAt} (${localOnlyKind}; searched root ${findRepoRoot(cwd)}; `
+          + `${modelLocal(model) ? "model OK" : "model REFUSED"})`
         : "";
       const go = isGoModel(model.provider)
         ? goLimit(model.provider, model.id ?? "")
