@@ -11,6 +11,34 @@
  * Zone can be overridden by a file in the directory where pi was opened (cwd):
  *   .zonegreen / .zoneyellow / .zonered   (precedence: red > yellow > green)
  *
+ * `.zonelocal` is not a colour — it is a hard mode. Placed in the repo root it means:
+ * the prompt and the context may only go to a model on loopback (127.0.0.0/8, localhost,
+ * ::1, 0.0.0.0). Network tools stay enabled; only the model destination is constrained.
+ *   interactive — session starts, warns before the first prompt, and REFUSES prompts
+ *                  while the active model is not loopback, so nothing is sent; the way out is
+ *                  the model's own picker (`/model` in TUI). The extension does not switch
+ *                  the model itself on purpose — `pi.setModel()` exists, but silently
+ *                  replacing a model the user picked is a product decision, not a fix.
+ *   non-interactive (print/rpc/json) — refused and the process exits 1: there is nobody to
+ *                  ask, and the run must not send anything out. Restart with a local --model.
+ * `/compact` (and `ctx.compact()`) send the whole context WITHOUT an `input` event, so they
+ *   are gated separately in `session_before_compact`.
+ * No escape hatch on purpose: lifting it means editing/removing the file, which leaves a trace.
+ * `.zonelocal` and the colour files do NOT override each other: `.zonelocal` is looked up in
+ * the repo root, `.zonegreen/.zoneyellow/.zonered` in cwd. There is no precedence contest.
+ *
+ * Three semantics worth knowing (all measured in a sandbox, 2026-09-28):
+ *   - nearest repo root, not every ancestor: a `.zonelocal` in `$HOME` would lock every repo
+ *     under it, and the mode has no escape hatch. Consequence worth knowing: inside a
+ *     submodule or a nested clone the nearest `.git` is that one, so a `.zonelocal` at the
+ *     outer root is NOT active there (fail-open by design; `/zone` prints the root it used).
+ *   - ANY filesystem entry named `.zonelocal` activates the mode, a directory included
+ *     (fail-closed both ways: a stray directory must not silently leak, and it must not
+ *     silently disable the gate either). `/zone` reports which kind it is and where it looked.
+ *   - `0.0.0.0` counts as loopback (it is the local-client alias; a server bound to it is
+ *     also reachable from the network, so this is a convention, and it is inherited from the
+ *     zone regex which has treated it as local since the beginning).
+ *
  * UI: the zone is shown as a persistent, colored `setStatus` entry. pi's built-in
  * footer renders extension statuses on a single line, sorted by key. The "zones" key
  * sorts after "caveman"/"deepseek-peak", so the colored zone lands at the RIGHT end of
@@ -24,9 +52,9 @@
  * Gate runs only in interactive (TUI) mode; it never blocks rpc/print/json.
  */
 
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type Zone = "green" | "yellow" | "red";
@@ -40,6 +68,39 @@ const RED_PROVIDERS = ["nvidia", "google"];
  */
 const LOOPBACK_HOST =
   /(?:^|\/\/|@)(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|\[::1\]|::1|0\.0\.0\.0)(?::\d+)?(?=[/:?]|$)/;
+
+/**
+ * Repo root for the `.zonelocal` lookup: walk up from cwd to the nearest `.git` (file for
+ * worktrees, dir for normal clones). No subprocess — pure path walk, MSYS-safe. If there is
+ * no git root, cwd itself is the root.
+ */
+function findRepoRoot(from: string): string {
+  let dir = resolve(from);
+  for (;;) {
+    if (existsSync(join(dir, ".git"))) return dir;
+    const up = dirname(dir);
+    if (up === dir) return resolve(from);
+    dir = up;
+  }
+}
+
+/** Path of `.zonelocal` when the hard local-only mode is on, else undefined. */
+function localOnlyFile(cwd: string): string | undefined {
+  if (!cwd) return undefined;
+  const p = join(findRepoRoot(cwd), ".zonelocal");
+  return existsSync(p) ? p : undefined;
+}
+
+/**
+ * Strict loopback test for `.zonelocal`: the ENDPOINT must be loopback, in the provider id
+ * (it may carry the url: "llama-server=http://127.0.0.1:8082") or in baseUrl. Deliberately
+ * does NOT reuse the zone rule "'local' in the name" — that one marks a remote model called
+ * `local-mirror` as green. Address only, no exceptions, no escape hatch.
+ */
+function isLoopbackModel(provider: string, _id: string, baseUrl: string): boolean {
+  return LOOPBACK_HOST.test((provider || "").toLowerCase())
+    || LOOPBACK_HOST.test((baseUrl || "").toLowerCase());
+}
 
 /** Precedence of zone override files in cwd: red > yellow > green. */
 function fileOverride(cwd: string): Zone | undefined {
@@ -220,6 +281,10 @@ export default function (pi: ExtensionAPI) {
   // Session state — reset on every start (also /resume, /new, /fork).
   let gatePending = false;
   let cwd = "";
+  // `.zonelocal` — hard mode: the model must be on loopback. Wins over `.zonered`.
+  let localOnly = false;
+  let localOnlyAt = "";
+  let localOnlyKind = ""; // "plik" | "katalog" | "nieczytelne" | "" — reported by /zone
 
   // opencode-go limits state (module-level per extension instance).
   let goPrices: Record<string, GoLimit> | undefined;
@@ -229,6 +294,122 @@ export default function (pi: ExtensionAPI) {
   function isGoModel(provider: string | undefined): boolean {
     return (provider || "").toLowerCase().includes("opencode-go");
   }
+
+  // --- .zonelocal helpers -------------------------------------------------
+
+  /** Structural subset of the handler context that the local-only gate needs. */
+  type CtxLike = {
+    mode?: string;
+    model?: ModelLike;
+    scopedModels?: readonly { model?: ModelLike }[];
+    ui?: { notify?: (message: string, level?: string) => void };
+    abort?: () => void;
+  };
+
+  function modelLocal(model: ModelLike | undefined): boolean {
+    if (!model) return false;
+    return isLoopbackModel(model.provider ?? "", model.id ?? "", model.baseUrl ?? "");
+  }
+
+  /**
+   * Loopback models available in this session, for the "use /model" hint.
+   *
+   * `ctx.scopedModels` is a getter on the handler context (NOT `getScopedModels()` — that one
+   * lives on the internal actions bag and is never exposed to handlers; using it silently
+   * yields `[]`). It is also legitimately empty unless a model scope is configured, so an
+   * empty list must not be reported as "there are no local models" — just point at /model.
+   */
+  function localModelsList(ctx: { scopedModels?: readonly { model?: ModelLike }[] }): string {    const scoped = ctx.scopedModels ?? [];
+    const names = scoped
+      .map((s) => s?.model)
+      .filter((m): m is ModelLike => !!m && modelLocal(m))
+      .map((m) => `${m.provider ?? "?"}/${m.id ?? "?"}`);
+    if (names.length > 0) return names.join(", ");
+    return "sprawdź listę przez /model (scopedModels puste bez skonfigurowanego scope)";
+  }
+
+  function localOnlyWhy(model: ModelLike | undefined, ctx: CtxLike): string {
+    const id = model ? `${model.provider ?? "?"}/${model.id ?? "?"}` : "brak";
+    const addr = model?.baseUrl || (model?.provider ?? "?");
+    // `/model` only exists in TUI; print/json get --model, rpc has its own set_model call.
+    const how = ctx.mode === "tui" ? "/model" : ctx.mode === "rpc" ? "set_model (RPC)" : "--model";
+    return localOnly
+      ? `zones: .zonelocal (${localOnlyAt}) — model ${id} nie jest loopback (adres: ${addr}). `
+        + `Wybierz model lokalny przez ${how}. Lokalne w tej sesji: ${localModelsList(ctx)}`
+      : "";
+  }
+
+  /**
+   * Secondary guard for the non-interactive modes that DO fire `model_select`. The primary
+   * boundary is `input` (see the handler below): measured, `model_select` does not fire in
+   * print mode, so it can never be the only line of defence.
+   *
+   * `process.exit(1)` instead of the orderly `ctx.shutdown()`: shutdown finishes with exit
+   * code 0, so a script reads a refused run as success (measured rc=0). A refused run has
+   * produced nothing, so an immediate non-zero exit is correct and safe.
+   */
+  function hardStop(ctx: { abort?: () => void }, why: string): void {
+    sayRefused(why);
+    ctx.abort?.();
+    process.exit(1);
+  }
+
+  /** Reason on stderr, written synchronously — console.error to a pipe can be lost on exit. */
+  function sayRefused(why: string): void {
+    try {
+      writeSync(2, `${why}\n[zones] przebieg nieinteraktywny w katalogu z .zonelocal — nic nie zostało wysłane do modelu.\n`);
+    } catch {
+      /* stderr closed */
+    }
+  }
+
+  /**
+   * Enforce `.zonelocal` for a model change. Fire-and-forget: the handlers that call it
+   * either notified (TUI) or stopped the process (non-interactive).
+   *
+   * Only enforced when the model is KNOWN (`ctx.model` may still be undefined at
+   * `session_start`), and refusing on "unknown" would block local models too. The real
+   * pre-request boundary is `input` (verified: `session.prompt()` runs the input handlers
+   * before `before_agent_start`, model check and auth).
+   *
+   * RPC is treated like print on purpose: `hasUI` is true there, but there is no human at a
+   * terminal to answer, so a silent "try again" would be a lie.
+   */
+  function enforceLocalOnly(model: ModelLike | undefined, ctx: CtxLike): void {
+    if (!localOnly || !model || modelLocal(model)) return;
+    const why = localOnlyWhy(model, ctx);
+    if (ctx.mode === "tui") {
+      // Keep the session alive: the model can still be switched with /model, and prompts are
+      // refused by the `input` handler. Only warn here.
+      try {
+        ctx.ui?.notify?.(why, "warning");
+      } catch {
+        /* UI not ready */
+      }
+    } else {
+      hardStop(ctx, why);
+    }
+  }
+
+  /** `/compact` and `ctx.compact()` send the whole context to the model WITHOUT an `input`
+   * event (TUI intercepts the command before session.prompt()), so the `input` gate would
+   * never see it. `session_before_compact` is the only cancellable boundary there. */
+  pi.on("session_before_compact", async (_event, ctx) => {
+    if (!localOnly) return;
+    const model = (ctx as { model?: ModelLike }).model;
+    if (modelLocal(model)) return;
+    const why = `${localOnlyWhy(model, ctx)} Kompresja do modela spoza loopback odrzucona.`;
+    if ((ctx as { mode?: string }).mode === "tui") {
+      try {
+        ctx.ui?.notify?.(why, "error");
+      } catch {
+        /* UI not ready */
+      }
+    } else {
+      sayRefused(why);
+    }
+    return { cancel: true };
+  });
 
   /** Background fetch of today's limits; re-renders the status when done. */
   function fetchGoPrices(): void {
@@ -292,6 +473,14 @@ export default function (pi: ExtensionAPI) {
     // Vivid+bold: theme "success" -> bazowy ANSI green (blady); bold podbija do bright green.
     // Separator " | " oddziela zone-tag wyraznie od statusow innych extension.
     let status = ctx.ui.theme.bold(ctx.ui.theme.fg(zoneColor(zone), ` | [zone ${zone}]`));
+    // `.zonelocal` is not a colour: show it as a separate tag, green when the active model
+    // is loopback, red when it is not (the `input` handler refuses prompts in that case).
+    if (localOnly) {
+      const okLocal = modelLocal(model);
+      status += " " + ctx.ui.theme.bold(
+        ctx.ui.theme.fg(okLocal ? "success" : "error", `| [local-only: ${okLocal ? "ok" : "refused"}]`),
+      );
+    }
     // Right of the zone: monthly go limit for opencode-go models only.
     lastCtx = ctx;
     const limit = goLimit(model.provider, model.id ?? "");
@@ -304,6 +493,22 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     cwd = ctx.cwd;
     gatePending = true;
+    localOnlyAt = localOnlyFile(cwd) ?? "";
+    localOnly = localOnlyAt !== "";
+    localOnlyKind = !localOnly
+      ? ""
+      : (() => {
+          try {
+            return statSync(localOnlyAt).isDirectory() ? "katalog" : "plik";
+          } catch {
+            return "nieczytelne";
+          }
+        })();
+    if (localOnly) {
+      // `ctx.model` (getter on the handler context) — NOT `ctx.getModel()`, which is an
+      // internal action and is undefined on handlers.
+      enforceLocalOnly((ctx as CtxLike).model, ctx as CtxLike);
+    }
     updateStatus(ctx);
   });
 
@@ -319,6 +524,9 @@ export default function (pi: ExtensionAPI) {
         cwd,
       );
       gatePending = zone !== "green";
+      // `.zonelocal`: a non-loopback model is refused. Interactive keeps the session (prompts
+      // are refused by `input`, /model can still fix it); non-interactive stops the process.
+      if (localOnly && !modelLocal(model)) enforceLocalOnly(model, ctx as CtxLike);
     }
     updateStatus(ctx);
   });
@@ -330,6 +538,30 @@ export default function (pi: ExtensionAPI) {
 
   // Prompt gate — only at session start / on model change, only interactively.
   pi.on("input", async (event, ctx) => {
+    // `.zonelocal` first: refuse the prompt outright while the model is not loopback. This is
+    // the guarantee (nothing is sent); the session stays alive so /model can fix it.
+    if (localOnly) {
+      const active = ctx.model as ModelLike | undefined;
+      if (active && !modelLocal(active)) {
+        const why = localOnlyWhy(active, ctx);
+        if (ctx.mode === "tui") {
+          // Keep the session: the model can still be switched with /model, and the prompt is
+          // simply not sent. This is the interactive half of the guarantee.
+          try {
+            ctx.ui.notify(why, "error");
+          } catch {
+            /* UI not ready */
+          }
+          return { action: "handled" };
+        }
+        // print/rpc/json: refuse AND exit non-zero. `input` is the only pre-request boundary
+        // that fires in these modes (measured: `model_select` does not fire in print mode), so
+        // this is the guarantee for scripted runs.
+        sayRefused(why);
+        ctx.abort?.();
+        process.exit(1);
+      }
+    }
     if (ctx.mode !== "tui") return { action: "continue" };
     if (event.source !== "interactive") return { action: "continue" };
     if (!gatePending) return { action: "continue" };
@@ -397,6 +629,10 @@ export default function (pi: ExtensionAPI) {
       const overrides = ["green", "yellow", "red"]
         .filter((z) => existsSync(join(cwd, `.zone${z}`)))
         .join(", ");
+      const localInfo = localOnly
+        ? ` | local-only: ${localOnlyAt} (${localOnlyKind}; szukane w roocie ${findRepoRoot(cwd)}; `
+          + `${modelLocal(model) ? "model OK" : "model ODRZUCONY"})`
+        : "";
       const go = isGoModel(model.provider)
         ? goLimit(model.provider, model.id ?? "")
         : undefined;
@@ -404,8 +640,8 @@ export default function (pi: ExtensionAPI) {
         ? ` | go-limit: ${go === undefined ? "loading/unknown" : go}`
         : "";
       ctx.ui.notify(
-        `${label} → zone ${zone}${overrides ? ` (override: ${overrides})` : ""}${goInfo}`,
-        zone === "red" ? "error" : zone === "yellow" ? "warning" : "info",
+        `${label} → zone ${zone}${overrides ? ` (override: ${overrides})` : ""}${localInfo}${goInfo}`,
+        localOnly && !modelLocal(model) ? "error" : zone === "red" ? "error" : zone === "yellow" ? "warning" : "info",
       );
     },
   });
