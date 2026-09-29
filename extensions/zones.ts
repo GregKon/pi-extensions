@@ -70,6 +70,23 @@ const LOOPBACK_HOST =
   /(?:^|\/\/|@)(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|\[::1\]|::1|0\.0\.0\.0)(?::\d+)?(?=[/:?]|$)/;
 
 /**
+ * Tools that reach the network on their own. Families (not an exhaustive list of names) so a
+ * new search package is covered by its prefix; measured in a live session: `web_search`,
+ * `source_check`, `fetch_content`, `get_search_content`, `keenable_search`, `keenable_fetch`,
+ * `greedy_search`, `greedy_fetch`. Best-effort by design — the `.zonelocal` prompt gate does
+ * not depend on this list, only the egress warning does, and it errs towards silence.
+ */
+const NETWORK_TOOL_RE = /^(?:web_|fetch_|source_check$|get_search_content$|keenable_|greedy_)/;
+
+/**
+ * pi-subagents tools that start a model call in a child process. Their model comes from
+ * `subagents.agentOverrides` and is remote in our setup, so a local parent prompt would still
+ * leave the machine. Names measured in `pi-subagents` (`subagent`, `subagent_supervisor`,
+ * `intercom`, `contact_supervisor`); `bg_wait` is excluded — waiting is not egress.
+ */
+const SPAWN_TOOL_RE = /^(?:subagent|subagent_supervisor|intercom|contact_supervisor)$/;
+
+/**
  * Repo root for the `.zonelocal` lookup: walk up from cwd to the nearest `.git` (file for
  * worktrees, dir for normal clones). No subprocess — pure path walk, MSYS-safe. If there is
  * no git root, cwd itself is the root.
@@ -284,6 +301,8 @@ export default function (pi: ExtensionAPI) {
   // `.zonelocal` — hard mode: the model must be on loopback. Wins over `.zonered`.
   let localOnly = false;
   let localOnlyAt = "";
+  // `.zonelocal` + egress: the user accepted the risk once for this session.
+  let egressConfirmed = false;
   let localOnlyKind = ""; // "plik" | "katalog" | "nieczytelne" | "" — reported by /zone
 
   // opencode-go limits state (module-level per extension instance).
@@ -490,9 +509,39 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("zones", status);
   }
 
+  /**
+   * Tools in THIS session that can still reach the network, and the pi-subagents spawners.
+   * `pi.getActiveTools()` is the effective list — it already reflects `--exclude-tools`
+   * (measured: `pinoweb` reports 5 tools, `piultralight` 9). `systemPromptOptions.selectedTools`
+   * must NOT be used here: it is the pre-exclusion registry list and still contains
+   * `keenable_search` in a profile that excluded it.
+   */
+  function egressTools(): { net: string[]; spawn: string[] } {
+    let active: string[] = [];
+    try {
+      active = pi.getActiveTools();
+    } catch {
+      return { net: [], spawn: [] };
+    }
+    return {
+      net: active.filter((n) => NETWORK_TOOL_RE.test(n)),
+      spawn: active.filter((n) => SPAWN_TOOL_RE.test(n)),
+    };
+  }
+
+  function egressWhy(net: string[], spawn: string[]): string {
+    const parts: string[] = [];
+    if (net.length > 0) parts.push(`network tools: ${net.join(", ")}`);
+    if (spawn.length > 0) {
+      parts.push(`subagent tools: ${spawn.join(", ")} — they call their own models, which are not loopback`);
+    }
+    return `zones: .zonelocal (${localOnlyAt}) keeps the prompt on this machine, but this session can still reach the network: ${parts.join("; ")}.`;
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     cwd = ctx.cwd;
     gatePending = true;
+    egressConfirmed = false; // once per session, so /new and /resume ask again
     localOnlyAt = localOnlyFile(cwd) ?? "";
     localOnly = localOnlyAt !== "";
     localOnlyKind = !localOnly
@@ -531,8 +580,32 @@ export default function (pi: ExtensionAPI) {
     updateStatus(ctx);
   });
 
+  /**
+   * Hard stop for subagent spawns while egress is unconfirmed. Covers the paths the `input`
+   * gate does not see: a prompt that arrives without passing it (queued message, another
+   * extension calling `sendMessage`) and the agent deciding mid-session to delegate. Network
+   * tools are NOT blocked here — the dialog already made the user decide about them.
+   */
+  pi.on("tool_call", async (event, ctx) => {
+    if (!localOnly || egressConfirmed) return;
+    const name = (event as { toolName?: string }).toolName ?? "";
+    if (!SPAWN_TOOL_RE.test(name)) return;
+    const why = `zones: .zonelocal (${localOnlyAt}) — subagent tool "${name}" refused: it calls its own model, which is not loopback. Confirm the prompt interactively to allow it.`;
+    if ((ctx as { mode?: string }).mode === "tui") {
+      try {
+        ctx.ui.notify(why, "error");
+      } catch {
+        /* UI not ready */
+      }
+    } else {
+      sayRefused(why);
+    }
+    return { block: true, reason: why };
+  });
+
   pi.on("session_shutdown", async (_event, ctx) => {
     gatePending = false;
+    egressConfirmed = false;
     ctx.ui.setStatus("zones", undefined);
   });
 
@@ -560,6 +633,39 @@ export default function (pi: ExtensionAPI) {
         sayRefused(why);
         ctx.abort?.();
         process.exit(1);
+      }
+    }
+    // `.zonelocal` second gate: the PROMPT is local, but tools (and subagents) are not. Asks
+    // once per session; with no UI there is nobody to answer, so the prompt is refused (the
+    // non-interactive mirror of the guarantee above).
+    if (localOnly && !egressConfirmed) {
+      const { net, spawn } = egressTools();
+      if (net.length > 0 || spawn.length > 0) {
+        const why = egressWhy(net, spawn);
+        if (ctx.mode === "tui" && ctx.hasUI && event.source === "interactive") {
+          let ok = false;
+          try {
+            ok = await ctx.ui.confirm(
+              "Local-only mode",
+              `${why}\n\nSend this prompt anyway? Tools can move data off this machine.`,
+            );
+          } catch {
+            ok = false;
+          }
+          if (!ok) {
+            try {
+              ctx.ui.notify(`${why} Prompt not sent.`, "warning");
+            } catch {
+              /* UI not ready */
+            }
+            return { action: "handled" };
+          }
+          egressConfirmed = true;
+        } else {
+          sayRefused(`${why} No interactive UI to confirm, so the prompt is refused.`);
+          ctx.abort?.();
+          process.exit(1);
+        }
       }
     }
     if (ctx.mode !== "tui") return { action: "continue" };
