@@ -108,7 +108,7 @@ export default function (pi: ExtensionAPI) {
     level = resolveLevel(settings);
     config = resolveConfig(settings);
     const pin = piHooksPin(settings);
-    drift = pin === VERIFIED_PI_HOOKS ? undefined : pin ? `${pin} != ${VERIFIED_PI_HOOKS}` : "brak wpisu w packages";
+    drift = pin === VERIFIED_PI_HOOKS ? undefined : pin ? `${pin} != ${VERIFIED_PI_HOOKS}` : "no entry in packages";
   }
 
   pi.on("session_start", (_event, ctx) => {

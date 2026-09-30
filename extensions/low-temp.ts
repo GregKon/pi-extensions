@@ -16,11 +16,11 @@ export default function (pi: ExtensionAPI) {
     default: "",
   });
 
-  // Temperatura ustawiona przez /temp w sesji (nadpisuje CLI).
+  // Temperature set by /temp during the session (overrides the CLI flag).
   let commandTemp: number | undefined;
 
   function resolveTemp(): number | undefined {
-    // /temp z sesji ma pierwszenstwo nad CLI.
+    // A /temp from the session takes precedence over the CLI flag.
     if (commandTemp !== undefined) return commandTemp;
     const tempVal = pi.getFlag("temp");
     if (typeof tempVal !== "string" || tempVal === "") return undefined;
@@ -29,12 +29,12 @@ export default function (pi: ExtensionAPI) {
     return temp;
   }
 
-  // JEDEN handler. Rejestrujemy zawsze; czyta wartosc w momencie requestu.
+  // ONE handler, registered unconditionally: it reads the value at request time.
   pi.on("before_provider_request", (event) => {
     const temp = resolveTemp();
-    if (temp === undefined) return; // nic nie nadpisujemy
+    if (temp === undefined) return; // nothing to override
     if (!event.payload || typeof event.payload !== "object") return;
-    // Udokumentowany kontrakt: zwracamy nowy payload.
+    // Documented contract: return the new payload.
     return { ...event.payload, temperature: temp };
   });
 
