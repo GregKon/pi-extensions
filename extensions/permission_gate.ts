@@ -42,13 +42,15 @@ const AGENT_DIR = getAgentDir();
 
 const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
-const BLOCK = `## Shell and permissions
-\`read\`/\`edit\`/\`write\`/\`grep\`/\`find\`/\`ls\` are never gated — use them instead of shell
-equivalents (\`cat\`, \`awk\`, \`python -c\`, \`node -e\`). Some shell commands need approval: the
-user gets a dialog. A bash call is graded by its worst segment: \`;\`, \`&&\`, \`|\` and
-\`$(...)\` split it, and unknown commands default to high — so one \`python -c\` or a
-substitution gates an otherwise read-only chain; give such a step its own call. Need more than
-the current level? Say so in text — never chain commands to slip past a prompt.`;
+// The "Shell and permissions" advisory used to be appended here via
+// `opts.appendSystemPrompt` in `before_agent_start`. pi does consume that mutation
+// (verified on 1.1.0: in a minimal setup the block reaches the rendered prompt), but in
+// the pilight profile family pi-caveman/pi-plan handlers return a `systemPrompt`, which
+// sets `forceSystemPrompt` — and then rendering ignores `appendSystemPrompt`, so the
+// block never reached the model there. The advisory now lives in the config repo as
+// `<AGENT_DIR>/rules/shell-permissions.md`, delivered by the `pilight` profile family
+// through the official `--append-system-prompt` flag (loader-level append renders even
+// with `forceSystemPrompt`).
 
 interface GateConfig {
   threshold: Level;
@@ -115,7 +117,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     refresh();
-    // Gate only above the threshold; at or below it the block (if any) is enough.
+    // Gate only above the threshold; at or below it no gating is needed.
     gatePending = config.gate && LEVELS.indexOf(level) > LEVELS.indexOf(config.threshold);
     if (!ctx.hasUI) return;
     if (drift) {
@@ -156,20 +158,13 @@ export default function (pi: ExtensionAPI) {
     return { action: "handled" };
   });
 
-  // Mirror the level into the system prompt — only at the threshold (low by default).
-  pi.on("before_agent_start", (event) => {
-    if (level !== config.threshold) return;
-    const opts = event.systemPromptOptions;
-    opts.appendSystemPrompt = opts.appendSystemPrompt ? `${opts.appendSystemPrompt}\n\n${BLOCK}` : BLOCK;
-  });
-
   pi.registerCommand("permission-gate", {
     description: "Show permission_gate state (level, threshold, pi-hooks pin drift)",
     handler: async (_args, ctx) => {
       refresh();
       const pin = drift ? `drift: ${drift}` : `pin ${VERIFIED_PI_HOOKS} (verified)`;
       ctx.ui.notify(
-        `permission_gate: level=${level}, threshold=${config.threshold}, gate=${config.gate ? "on" : "off"}, block=${level === config.threshold ? "injected" : "not injected"}, ${pin}`,
+        `permission_gate: level=${level}, threshold=${config.threshold}, gate=${config.gate ? "on" : "off"}, ${pin}`,
         drift ? "warning" : "info",
       );
     },
