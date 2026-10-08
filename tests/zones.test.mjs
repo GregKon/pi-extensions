@@ -1,6 +1,12 @@
 // zones.ts — headless tests for the `.zonelocal` gates and the English-only rule.
 //
 // Run: node --test tests/zones.test.mjs        (Node >= 22, no dependencies, no pty needed)
+//      node --test tests/*.test.mjs            (both test files; a bare `tests/` directory argument
+//                                               fails on Node 24 with MODULE_NOT_FOUND)
+//
+// Requires ZONELOCAL_DIR (a directory containing a `.zonelocal` file) and PLAIN_DIR (a directory
+// without one); without them the gate cases fail. scripts/doctor.sh CHECK 13 sets both from a
+// `mktemp -d` and runs the whole suite.
 //
 // The extension is loaded directly and driven with a stub context, so this proves the handler
 // logic, NOT pi integration. The pi-side contracts it relies on (verified in pi's dist):

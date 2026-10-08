@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
  * permission_gate — tells the model what the pi-hooks permission level actually means, and
@@ -27,7 +26,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  *   - we cannot detect whether pi-hooks is loaded at all (no API lists loaded extensions),
  *     so in a profile without it the injected text describes a gate that is not there.
  *
- * Config in ~/.pi/agent/settings.json:
+ * Config in <agent-dir>/settings.json:
  *   "permissionGate": { "threshold": "low", "gate": true }
  */
 
@@ -38,7 +37,10 @@ const LEVELS: Level[] = ["minimal", "low", "medium", "high", "bypassed"];
 /** pi-hooks version whose behaviour this file was written against. */
 const VERIFIED_PI_HOOKS = "1.0.2";
 
-const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+/** Agent dir, resolved by pi itself, so pi and this extension can never disagree on the directory. */
+const AGENT_DIR = getAgentDir();
+
+const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
 const BLOCK = `## Shell and permissions
 \`read\`/\`edit\`/\`write\`/\`grep\`/\`find\`/\`ls\` are never gated — use them instead of shell

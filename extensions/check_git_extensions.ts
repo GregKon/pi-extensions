@@ -1,8 +1,10 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+/** Agent dir, resolved by pi itself, so pi and this extension can never disagree on the directory. */
+const AGENT_DIR = getAgentDir();
 
 /** Checks pinned git extension packages for newer tags. */
 export default function (pi: ExtensionAPI) {
@@ -31,7 +33,7 @@ interface Report {
 }
 
 function agentSettingsPath(): string {
-  return join(homedir(), ".pi", "agent", "settings.json");
+  return join(AGENT_DIR, "settings.json");
 }
 
 function readGitPackages(): GitPackage[] {
@@ -163,12 +165,12 @@ async function checkGitExtensions(): Promise<Report> {
   }
 
   const summary = `git extensions: ${ok} ok, ${newer} newer, ${unpinned} unpinned, ${errors} errors`;
-  const filePath = join(homedir(), ".pi", "agent", "data", "git-extension-check.md");
+  const filePath = join(AGENT_DIR, "data", "git-extension-check.md");
   return { summary, rows, filePath };
 }
 
 function writeReportFile(report: Report): void {
   const header = `# git extension check — ${new Date().toISOString()}\n\n${report.summary}\n\n`;
-  mkdirSync(join(homedir(), ".pi", "agent", "data"), { recursive: true });
+  mkdirSync(join(AGENT_DIR, "data"), { recursive: true });
   writeFileSync(report.filePath, header + report.rows.join("\n") + "\n");
 }

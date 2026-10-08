@@ -5,7 +5,7 @@
  * Title: session name (e.g. "extension")
  * Body: last 3 words of the last user prompt + time + run duration.
  *
- * Toggle: /notify on|off (default OFF, persisted in ~/.pi/agent/notify-config.json)
+ * Toggle: /notify on|off (default OFF, persisted in <agent-dir>/notify-config.json)
  *
  * OSC 777 is parsed natively by VS Code 1.131+ (and Ghostty/iTerm2/WezTerm),
  * and flows through SSH to the local terminal.
@@ -13,10 +13,12 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "notify-config.json");
+/** Agent dir, resolved by pi itself, so pi and this extension can never disagree on the directory. */
+const AGENT_DIR = getAgentDir();
+
+const CONFIG_PATH = join(AGENT_DIR, "notify-config.json");
 
 let lastPrompt: string | undefined;
 let runStart: number | undefined;
