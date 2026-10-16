@@ -40,8 +40,8 @@ function load(activeTools) {
   return handlers;
 }
 
-function makeCtx(cwd, { mode = "tui", answer = true, hasUI = mode !== "print" } = {}) {
-  const calls = { confirm: [], notify: [] };
+function makeCtx(cwd, { mode = "tui", answer = true, hasUI = mode !== "print", inputAnswer = "yes" } = {}) {
+  const calls = { confirm: [], notify: [], input: [] };
   return {
     calls,
     ctx: {
@@ -51,6 +51,7 @@ function makeCtx(cwd, { mode = "tui", answer = true, hasUI = mode !== "print" } 
       abort() { calls.aborted = true; },
       ui: {
         confirm: async (title, message) => { calls.confirm.push({ title, message }); return answer; },
+        input: async (prompt, _placeholder) => { calls.input.push({ prompt }); return inputAnswer; },
         notify: (m, level) => calls.notify.push({ m, level }),
         setStatus() {},
         theme: { bold: (s) => s, fg: (_c, s) => s },
@@ -226,7 +227,30 @@ test("without .zonelocal nothing is blocked", async () => {
   assert.equal(await toolCall(h, "subagent", ctx), undefined);
 });
 
-// ------------------------------------------------------------- English-only
+// ----------------------------------------------------------- zone: red (contributor)
+test("contributor model gets zone red and requires 2 confirmations", async () => {
+  const h = load(CLEAN);
+  // inputAnswer "yes" both times — gate should pass after 2 prompts
+  const { ctx, calls } = makeCtx(PLAIN, { inputAnswer: "yes" });
+  ctx.model = { provider: "opencode-go", id: "muse-spark-1.3-contributor", name: "Muse Spark 1.3 Contributor", baseUrl: "" };
+  await start(h, ctx);
+  const r = await input(h, {}, ctx);
+  // zone=red: 2 text-input confirmations, prompt passes
+  assert.equal(calls.input.length, 2, "red zone must ask twice");
+  assert.notEqual(r?.action, "handled", "prompt must pass after 2 confirmations");
+});
+
+test("contributor model in id gets zone red even when name is neutral", async () => {
+  const h = load(CLEAN);
+  const { ctx, calls } = makeCtx(PLAIN, { inputAnswer: "no" });
+  ctx.model = { provider: "openrouter", id: "muse/spark-contributor", name: "Spark Model", baseUrl: "" };
+  await start(h, ctx);
+  const r = await input(h, {}, ctx);
+  // zone=red: first "no" → rejected, 1 call only (breaks early)
+  assert.equal(calls.input.length, 1, "first 'no' must stop immediately");
+  assert.equal(r?.action, "handled", "prompt must be swallowed on rejection");
+});
+
 test("no Polish left in the public extensions", () => {
   // A diacritic check is not enough: "brak", "plik" or "katalog" are plain ASCII.
   const words = /\b(brak|plik|katalog|nieczytelne|wpisu|ustawiona|nadpisuje|pierwszenstwo|rejestrujemy|wartosc|nic)\b/i;

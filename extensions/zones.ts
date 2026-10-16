@@ -5,7 +5,7 @@
  *   green  — local model: provider/model name contains 'local' (e.g. apiKey: "local")
  *            OR the endpoint is loopback (127.0.0.0/8, localhost, ::1, 0.0.0.0) —
  *            e.g. provider "llama-server=http://127.0.0.1:8082" / llama.cpp
- *   red    — model name contains 'free' OR provider is nvidia/google (they train on your data)
+ *   red    — id/name contains 'free' or 'contributor', OR provider is nvidia/google (they train on your data)
  *   yellow — everything else
  *
  * Zone can be overridden by a file in the directory where pi was opened (cwd):
@@ -158,8 +158,9 @@ function autoZone(provider: string, id: string, name: string, baseUrl: string): 
   // The provider id itself may carry the URL ("llama-server=http://127.0.0.1:8082").
   if (LOOPBACK_HOST.test(p) || LOOPBACK_HOST.test((baseUrl || "").toLowerCase())) return "green";
 
-  // red: 'free' in the name, or provider is nvidia/google
+  // red: 'free' or 'contributor' in id/name, or provider is nvidia/google
   if (i.includes("free") || n.includes("free")) return "red";
+  if (i.includes("contributor") || n.includes("contributor")) return "red";
   if (RED_PROVIDERS.some((rp) => p.includes(rp))) return "red";
 
   // everything else -> yellow
@@ -178,13 +179,19 @@ function computeZone(
 
 // --- opencode-go monthly limits ---
 //
-// Source of truth: https://opencode.ai/docs/go/ ("Usage limits" table).
+// Source of truth: https://opencode.ai/v2/docs/console/go ("Usage limits" table).
+// The old path /docs/go/ answers 404 (verified 2026-10-13) and /docs/go.md too, so
+// the v2 console page is the live one. That page renders TWO tab panels with a full
+// table each ("Go" and "Go Plus"); parseLimits picks the first table whose header
+// starts with "Model", i.e. the Go panel, so the Plus limits ($180/$240...) are
+// deliberately ignored. A parser that scanned every row would end up with Plus values.
 // Limits change day-to-day, so we fetch the docs page at most once per day and
-// cache the parsed table in os.tmpdir(). If today's fetch fails, we fall back
-// to the newest older cache; if there is no cache at all, the limit segment
-// simply stays hidden (never blocks, never crashes).
+// cache the parsed table in os.tmpdir(). If today's fetch fails, we fall back to the
+// newest older cache and mark the number with `*`; with no cache at all the segment
+// becomes a visible `$? (why)` error for opencode-go models. Previously both cases
+// were silent, which is how a dead URL could hide the limits indefinitely.
 
-const GO_DOCS_URL = "https://opencode.ai/docs/go/";
+const GO_DOCS_URL = "https://opencode.ai/v2/docs/console/go";
 const GO_CACHE_PREFIX = "opencode-go-prices-";
 type GoLimit = number | "unlimited";
 
@@ -198,8 +205,12 @@ function cachePath(day: string): string {
   return join(tmpdir(), `${GO_CACHE_PREFIX}${day}.json`);
 }
 
-/** Read today's cache, or the newest older one (offline fallback). */
-function loadCache(): Record<string, GoLimit> | undefined {
+/**
+ * Read today's cache, or the newest older one (offline fallback).
+ * `stale` is true when the values come from an older file — the caller shows them
+ * with a `*` so a frozen number is never mistaken for a fresh one.
+ */
+function loadCache(): { models: Record<string, GoLimit>; stale: boolean } | undefined {
   try {
     const files = readdirSync(tmpdir())
       .filter((f) => f.startsWith(GO_CACHE_PREFIX) && f.endsWith(".json"))
@@ -210,10 +221,12 @@ function loadCache(): Record<string, GoLimit> | undefined {
     for (const p of paths) {
       if (!existsSync(p)) continue;
       const json = JSON.parse(readFileSync(p, "utf8")) as { models?: Record<string, GoLimit> };
-      if (json.models && Object.keys(json.models).length > 0) return json.models;
+      if (json.models && Object.keys(json.models).length > 0) {
+        return { models: json.models, stale: p !== today };
+      }
     }
   } catch {
-    // tmpdir unreadable / broken cache — limit segment stays hidden.
+    // tmpdir unreadable / broken cache — caller falls back to the `$?` error segment.
   }
   return undefined;
 }
@@ -242,7 +255,8 @@ function normId(name: string): string {
 function parseLimits(html: string): Record<string, GoLimit> {
   const models: Record<string, GoLimit> = {};
   const table = html.match(/<table><thead><tr><th>Model<\/th>.*?<\/table>/s);
-  const body = table ? table[0] : html;
+  if (!table) return {};
+  const body = table[0];
   const rows = body.matchAll(/<tr>([\s\S]*?)<\/tr>/g);
   for (const row of rows) {
     const cells = [...row[1].matchAll(/<td>([\s\S]*?)<\/td>/g)].map((m) => m[1]);
@@ -273,12 +287,28 @@ function limitLabel(
   limit: GoLimit,
   bold: (s: string) => string,
   fg: (c: "success" | "warning" | "error", s: string) => string,
+  stale = false,
 ): string {
+  const mark = stale ? "*" : "";
   if (limit === "unlimited") {
-    return bold(`${ORANGE} | unlimited${RESET_FG}`);
+    return bold(`${ORANGE} | unlimited${RESET_FG}${mark}`);
   }
   const color: "success" | "warning" | "error" = limit >= 60 ? "success" : limit > 15 ? "warning" : "error";
-  return bold(fg(color, ` | $${limit}`));
+  return bold(fg(color, ` | $${limit}${mark}`));
+}
+
+/**
+ * Visible failure for an opencode-go model with no limit data. `why` names the cause
+ * (`no data` = nothing fetched yet, `fetch failed` = offline/404/layout change,
+ * `model not in docs` = docs have no row for this id) so the segment is actionable
+ * instead of a silently missing number.
+ */
+function limitErrorLabel(
+  why: string,
+  bold: (s: string) => string,
+  fg: (c: "success" | "warning" | "error", s: string) => string,
+): string {
+  return bold(fg("error", ` | $? (${why})`));
 }
 
 /** pi theme color for a zone (success=green, warning=yellow, error=red). */
@@ -324,6 +354,8 @@ export default function (pi: ExtensionAPI) {
 
   // opencode-go limits state (module-level per extension instance).
   let goPrices: Record<string, GoLimit> | undefined;
+  let goStale = false; // values came from an older cache file
+  let goFetchFailed = false; // today's fetch failed (offline / 404 / layout change)
   let goFetching = false;
   let lastCtx: { model?: unknown; thinkingLevel?: string } | undefined;
 
@@ -462,6 +494,8 @@ export default function (pi: ExtensionAPI) {
         const models = parseLimits(html);
         if (Object.keys(models).length > 0) {
           goPrices = models;
+          goStale = false;
+          goFetchFailed = false;
           try {
             writeFileSync(
               cachePath(dayStamp()),
@@ -474,7 +508,10 @@ export default function (pi: ExtensionAPI) {
         }
       })
       .catch(() => {
-        // offline / layout change — older cache already loaded, stay silent
+        // offline / 404 / layout change — keep whatever older cache was loaded, mark it
+        // stale and surface the failure in the status line instead of hiding the segment.
+        goFetchFailed = true;
+        if (lastCtx) updateStatus(lastCtx);
       })
       .finally(() => {
         clearTimeout(timer);
@@ -486,8 +523,13 @@ export default function (pi: ExtensionAPI) {
   function goLimit(provider: string | undefined, id: string): GoLimit | undefined {
     if (!isGoModel(provider)) return undefined;
     if (goPrices === undefined) {
-      goPrices = loadCache();
-      if (goPrices === undefined) fetchGoPrices();
+      const cached = loadCache();
+      if (cached) {
+        goPrices = cached.models;
+        goStale = cached.stale;
+      } else {
+        fetchGoPrices();
+      }
     }
     if (!goPrices) return undefined; // fetch in flight, no cache yet
     return goPrices[normId(id)];
@@ -509,8 +551,8 @@ export default function (pi: ExtensionAPI) {
     );
     // Key "zones" sorts after "caveman"/"deepseek-peak" -> lands at the right end of the status line.
     // Only the zone tag is shown; the model name already appears on the right side of the footer.
-    // Vivid+bold: theme "success" -> bazowy ANSI green (blady); bold podbija do bright green.
-    // Separator " | " oddziela zone-tag wyraznie od statusow innych extension.
+    // Vivid+bold: theme "success" -> base ANSI green; bold boosts to bright green.
+    // Separator " | " clearly divides zone-tag from other extension statuses.
     let status = ctx.ui.theme.bold(ctx.ui.theme.fg(zoneColor(zone), ` | [zone ${zone}]`));
     // `.zonelocal` is not a colour: show it as a separate tag, green when the active model
     // is loopback, red when it is not (the `input` handler refuses prompts in that case).
@@ -523,8 +565,16 @@ export default function (pi: ExtensionAPI) {
     // Right of the zone: monthly go limit for opencode-go models only.
     lastCtx = ctx;
     const limit = goLimit(model.provider, model.id ?? "");
+    const boldLabel = (s: string) => ctx.ui.theme.bold(s);
+    const fgLabel = (c: "success" | "warning" | "error", s: string) => ctx.ui.theme.fg(c, s);
     if (limit !== undefined) {
-      status += limitLabel(limit, (s) => ctx.ui.theme.bold(s), (c, s) => ctx.ui.theme.fg(c, s));
+      status += limitLabel(limit, boldLabel, fgLabel, goStale || goFetchFailed);
+    } else if (isGoModel(model.provider)) {
+      status += limitErrorLabel(
+        goFetchFailed ? "fetch failed" : goPrices ? "model not in docs" : "no data",
+        boldLabel,
+        fgLabel,
+      );
     }
     ctx.ui.setStatus("zones", status);
   }
@@ -572,6 +622,8 @@ export default function (pi: ExtensionAPI) {
     cwd = ctx.cwd;
     gatePending = true;
     egressConfirmed = false; // once per session, so /new and /resume ask again
+    goFetchFailed = false;
+    goStale = false;
     localOnlyAt = localOnlyFile(cwd) ?? "";
     localOnly = localOnlyAt !== "";
     localOnlyKind = !localOnly
