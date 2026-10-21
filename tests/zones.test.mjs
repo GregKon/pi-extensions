@@ -266,3 +266,150 @@ test("no hardcoded locale in the notification footer", () => {
   const text = readFileSync(join(EXT, "notify.ts"), "utf8");
   assert.equal(/toLocale(Time|Date)String\(\s*"[a-z]{2}-[A-Z]{2}"/.test(text), false, "pin no locale string");
 });
+
+// ----------------------------------------------------------- opencode-go and openrouter diff & pricing
+test("parseLimits extracts monthly limits correctly from HTML", () => {
+  const html = `
+    <table><thead><tr><th>Model</th><th>Input</th><th>Monthly limit</th></tr></thead>
+    <tbody>
+      <tr><td>GLM-5.3-Flash</td><td>$0.15</td><td><strong>$60</strong></td></tr>
+      <tr><td>Step 5 Preview</td><td>$1.00</td><td><del>$15</del> <strong>$60</strong><br/><small>promo</small></td></tr>
+      <tr><td>LongCat 2.5 Preview Free</td><td>Free</td><td><strong>Unlimited</strong><br/><small>limited time</small></td></tr>
+      <tr><td>Qwen3.8 Max</td><td>$2.00</td><td>$15</td></tr>
+    </tbody></table>
+  `;
+  const limits = mod.parseLimits(html);
+  assert.equal(limits["glm5.3flash"], 60);
+  assert.equal(limits["step5preview"], 60);
+  assert.equal(limits["longcat2.5preview"], "unlimited");
+  assert.equal(limits["qwen3.8max"], 15);
+});
+
+test("parseLimits returns empty object for malformed or missing table", () => {
+  assert.deepEqual(mod.parseLimits("<div>No table here</div>"), {});
+  assert.deepEqual(mod.parseLimits(""), {});
+});
+
+test("parseOpenRouterPricing parses token pricing per 1M tokens", () => {
+  const data = {
+    data: [
+      { id: "moonshotai/kimi-k2.7-code", pricing: { prompt: "0.0000006712", completion: "0.00000335" } },
+      { id: "z-ai/glm-5.3-flash", pricing: { prompt: "0.0000000412", completion: "0.00000012" } },
+      { id: "free/model", pricing: { prompt: "0", completion: "0" } },
+      { id: "broken/model", pricing: null },
+    ],
+  };
+  const pricing = mod.parseOpenRouterPricing(data);
+  assert.ok(pricing["moonshotai/kimi-k2.7-code"]);
+  assert.equal(pricing["moonshotai/kimi-k2.7-code"].input, 0.6712);
+  assert.equal(pricing["moonshotai/kimi-k2.7-code"].output, 3.35);
+  assert.equal(pricing["z-ai/glm-5.3-flash"].input, 0.0412);
+  assert.equal(pricing["z-ai/glm-5.3-flash"].output, 0.12);
+  assert.equal(pricing["free/model"].input, 0);
+  assert.equal(pricing["free/model"].output, 0);
+  assert.equal(pricing["broken/model"], undefined);
+});
+
+test("computePriceDiff handles initial cache with no previous cache", () => {
+  const current = {
+    date: "2026-10-21",
+    opencode: { models: { "glm5.3flash": 60 } },
+    openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.0412, output: 0.12 } } },
+  };
+  const diff = mod.computePriceDiff(undefined, current);
+  assert.equal(diff.hasChanges, false);
+});
+
+test("computePriceDiff detects added, removed, and changed OpenCode limits", () => {
+  const previous = {
+    date: "2026-10-20",
+    opencode: { models: { "glm5.3flash": 15, "oldmodel": 15 } },
+    openrouter: { models: {} },
+  };
+  const current = {
+    date: "2026-10-21",
+    opencode: { models: { "glm5.3flash": 60, "newmodel": 60 } },
+    openrouter: { models: {} },
+  };
+  const diff = mod.computePriceDiff(previous, current);
+  assert.equal(diff.hasChanges, true);
+  assert.equal(diff.opencode.added.length, 1);
+  assert.equal(diff.opencode.added[0].model, "newmodel");
+  assert.equal(diff.opencode.removed.length, 1);
+  assert.equal(diff.opencode.removed[0].model, "oldmodel");
+  assert.equal(diff.opencode.changed.length, 1);
+  assert.equal(diff.opencode.changed[0].model, "glm5.3flash");
+  assert.equal(diff.opencode.changed[0].oldLimit, 15);
+  assert.equal(diff.opencode.changed[0].newLimit, 60);
+  assert.match(diff.summary, /\+1 Go model added/);
+  assert.match(diff.summary, /-1 Go model removed/);
+  assert.match(diff.summary, /1 Go limit change/);
+});
+
+test("computePriceDiff detects OpenRouter pricing changes", () => {
+  const previous = {
+    date: "2026-10-20",
+    opencode: { models: { "glm5.3flash": 60 } },
+    openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.05, output: 0.15 } } },
+  };
+  const current = {
+    date: "2026-10-21",
+    opencode: { models: { "glm5.3flash": 60 } },
+    openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.0412, output: 0.12 } } },
+  };
+  const diff = mod.computePriceDiff(previous, current);
+  assert.equal(diff.hasChanges, true);
+  assert.equal(diff.openrouter.changed.length, 1);
+  assert.equal(diff.openrouter.changed[0].model, "z-ai/glm-5.3-flash");
+  assert.equal(diff.openrouter.changed[0].oldPrice.input, 0.05);
+  assert.equal(diff.openrouter.changed[0].newPrice.input, 0.0412);
+  assert.match(diff.summary, /1 OpenRouter price change/);
+});
+
+test("formatGoDiffTable formats a table with required columns", () => {
+  const current = {
+    date: "2026-10-21",
+    opencode: { models: { "glm5.3flash": 60 } },
+    openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.0412, output: 0.12 } } },
+  };
+  const previous = {
+    date: "2026-10-20",
+    opencode: { models: { "glm5.3flash": 15 } },
+    openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.05, output: 0.15 } } },
+  };
+  const table = mod.formatGoDiffTable(current, previous);
+  assert.match(table, /Model/);
+  assert.match(table, /OpenCode Limit/);
+  assert.match(table, /OpenRouter Price \(Input \/ Output per 1M\)/);
+  assert.match(table, /Status/);
+  assert.match(table, /glm5\.3flash/);
+  assert.match(table, /\$60/);
+  assert.match(table, /\$0\.0412 \/ \$0\.1200/);
+  assert.match(table, /limit: \$15 -> \$60/);
+});
+
+test("registers /go-diff slash command", async () => {
+  const commands = {};
+  const pi = {
+    on() {},
+    getActiveTools: () => [],
+    registerCommand(name, opts) { commands[name] = opts; },
+    registerTool() {},
+    addFlag() {},
+  };
+  mod.default(pi);
+  assert.ok(commands["go-diff"], "/go-diff command must be registered");
+  assert.equal(typeof commands["go-diff"].handler, "function");
+
+  const logs = [];
+  const origLog = console.log;
+  console.log = (...args) => logs.push(args.join(" "));
+  try {
+    await commands["go-diff"].handler("", {
+      ui: { notify() {} },
+    });
+  } finally {
+    console.log = origLog;
+  }
+  assert.ok(logs.length > 0, "handler must print table or message to console");
+});

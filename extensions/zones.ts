@@ -192,8 +192,41 @@ function computeZone(
 // were silent, which is how a dead URL could hide the limits indefinitely.
 
 const GO_DOCS_URL = "https://opencode.ai/v2/docs/console/go";
+const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const GO_CACHE_PREFIX = "opencode-go-prices-";
-type GoLimit = number | "unlimited";
+const GO_DIFF_PREFIX = "opencode-go-diff-";
+
+export type GoLimit = number | "unlimited";
+
+export interface OpenRouterPrice {
+  input: number; // USD per 1M tokens
+  output: number; // USD per 1M tokens
+}
+
+export interface CachedPrices {
+  date: string;
+  source?: string;
+  models?: Record<string, GoLimit>;
+  opencode?: {
+    models: Record<string, GoLimit>;
+  };
+  openrouter?: {
+    models: Record<string, OpenRouterPrice>;
+  };
+}
+
+export interface PriceDiff {
+  opencode: {
+    added: Array<{ model: string; limit: GoLimit }>;
+    removed: Array<{ model: string; limit: GoLimit }>;
+    changed: Array<{ model: string; oldLimit: GoLimit; newLimit: GoLimit }>;
+  };
+  openrouter: {
+    changed: Array<{ model: string; oldPrice: OpenRouterPrice; newPrice: OpenRouterPrice }>;
+  };
+  hasChanges: boolean;
+  summary: string;
+}
 
 /** Current UTC day (YYYY-MM-DD), used as cache file stamp. */
 function dayStamp(): string {
@@ -205,12 +238,17 @@ function cachePath(day: string): string {
   return join(tmpdir(), `${GO_CACHE_PREFIX}${day}.json`);
 }
 
+/** Daily diff notification flag path: {tmpdir}/opencode-go-diff-YYYY-MM-DD.flag */
+function flagPath(day: string): string {
+  return join(tmpdir(), `${GO_DIFF_PREFIX}${day}.flag`);
+}
+
 /**
  * Read today's cache, or the newest older one (offline fallback).
  * `stale` is true when the values come from an older file — the caller shows them
  * with a `*` so a frozen number is never mistaken for a fresh one.
  */
-function loadCache(): { models: Record<string, GoLimit>; stale: boolean } | undefined {
+function loadCache(): { models: Record<string, GoLimit>; stale: boolean; raw?: CachedPrices } | undefined {
   try {
     const files = readdirSync(tmpdir())
       .filter((f) => f.startsWith(GO_CACHE_PREFIX) && f.endsWith(".json"))
@@ -220,15 +258,49 @@ function loadCache(): { models: Record<string, GoLimit>; stale: boolean } | unde
     const paths = [today, ...files.map((f) => join(tmpdir(), f))];
     for (const p of paths) {
       if (!existsSync(p)) continue;
-      const json = JSON.parse(readFileSync(p, "utf8")) as { models?: Record<string, GoLimit> };
-      if (json.models && Object.keys(json.models).length > 0) {
-        return { models: json.models, stale: p !== today };
+      const json = JSON.parse(readFileSync(p, "utf8")) as CachedPrices;
+      const models = json.opencode?.models || json.models;
+      if (models && Object.keys(models).length > 0) {
+        return { models, stale: p !== today, raw: json };
       }
     }
   } catch {
     // tmpdir unreadable / broken cache — caller falls back to the `$?` error segment.
   }
   return undefined;
+}
+
+/** Read today's cached prices if present. */
+function loadTodayCache(): CachedPrices | undefined {
+  try {
+    const p = cachePath(dayStamp());
+    if (!existsSync(p)) return undefined;
+    return JSON.parse(readFileSync(p, "utf8")) as CachedPrices;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Read the newest older cache file before `currentDay` to compare diffs.
+ */
+function loadPreviousCache(currentDay: string): CachedPrices | undefined {
+  try {
+    const files = readdirSync(tmpdir())
+      .filter((f) => f.startsWith(GO_CACHE_PREFIX) && f.endsWith(".json"))
+      .map((f) => {
+        const match = f.match(new RegExp(`^${GO_CACHE_PREFIX}(\\d{4}-\\d{2}-\\d{2})\\.json$`));
+        return match ? { file: f, day: match[1] } : null;
+      })
+      .filter((item): item is { file: string; day: string } => item !== null && item.day < currentDay)
+      .sort((a, b) => b.day.localeCompare(a.day));
+
+    if (files.length === 0) return undefined;
+    const p = join(tmpdir(), files[0].file);
+    return JSON.parse(readFileSync(p, "utf8")) as CachedPrices;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -252,7 +324,7 @@ function normId(name: string): string {
  *            | <strong>Unlimited</strong><br><small>limited time</small>
  * Promo rows keep both struck-through and current values — take the <strong> one.
  */
-function parseLimits(html: string): Record<string, GoLimit> {
+export function parseLimits(html: string): Record<string, GoLimit> {
   const models: Record<string, GoLimit> = {};
   const table = html.match(/<table><thead><tr><th>Model<\/th>.*?<\/table>/s);
   if (!table) return {};
@@ -276,6 +348,201 @@ function parseLimits(html: string): Record<string, GoLimit> {
     if (limit !== undefined && name) models[normId(name)] = limit;
   }
   return models;
+}
+
+/**
+ * Parse public OpenRouter pricing into token prices per 1M tokens.
+ */
+export function parseOpenRouterPricing(data: unknown): Record<string, OpenRouterPrice> {
+  const result: Record<string, OpenRouterPrice> = {};
+  if (!data || typeof data !== "object") return result;
+  const list = (data as { data?: unknown[] }).data;
+  if (!Array.isArray(list)) return result;
+
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const id = (item as { id?: unknown }).id;
+    const pricing = (item as { pricing?: unknown }).pricing;
+    if (typeof id !== "string" || !id || !pricing || typeof pricing !== "object") continue;
+
+    const p = pricing as { prompt?: unknown; completion?: unknown };
+    const prompt = typeof p.prompt === "string" ? parseFloat(p.prompt) : typeof p.prompt === "number" ? p.prompt : NaN;
+    const completion = typeof p.completion === "string" ? parseFloat(p.completion) : typeof p.completion === "number" ? p.completion : NaN;
+
+    if (!isNaN(prompt) && !isNaN(completion)) {
+      result[id] = {
+        input: Math.round(prompt * 1_000_000 * 10000) / 10000,
+        output: Math.round(completion * 1_000_000 * 10000) / 10000,
+      };
+    }
+  }
+  return result;
+}
+
+/**
+ * Compute differences comparing today's cached prices against previous cache.
+ */
+export function computePriceDiff(
+  prev: CachedPrices | undefined,
+  curr: CachedPrices,
+): PriceDiff {
+  const diff: PriceDiff = {
+    opencode: { added: [], removed: [], changed: [] },
+    openrouter: { changed: [] },
+    hasChanges: false,
+    summary: "",
+  };
+
+  if (!prev) {
+    diff.summary = "OpenCode Go & OpenRouter: initial data loaded, no previous cache to compare.";
+    return diff;
+  }
+
+  const prevGo = prev.opencode?.models || prev.models || {};
+  const currGo = curr.opencode?.models || curr.models || {};
+  const prevOR = prev.openrouter?.models || {};
+  const currOR = curr.openrouter?.models || {};
+
+  // OpenCode Go changes
+  for (const [model, limit] of Object.entries(currGo)) {
+    if (!(model in prevGo)) {
+      diff.opencode.added.push({ model, limit });
+    } else if (prevGo[model] !== limit) {
+      diff.opencode.changed.push({ model, oldLimit: prevGo[model], newLimit: limit });
+    }
+  }
+
+  for (const [model, limit] of Object.entries(prevGo)) {
+    if (!(model in currGo)) {
+      diff.opencode.removed.push({ model, limit });
+    }
+  }
+
+  // OpenRouter changes: model pricing changes
+  for (const [model, price] of Object.entries(currOR)) {
+    if (model in prevOR) {
+      const old = prevOR[model];
+      if (old.input !== price.input || old.output !== price.output) {
+        diff.openrouter.changed.push({ model, oldPrice: old, newPrice: price });
+      }
+    }
+  }
+
+  const goAdded = diff.opencode.added.length;
+  const goRemoved = diff.opencode.removed.length;
+  const goChanged = diff.opencode.changed.length;
+  const orChanged = diff.openrouter.changed.length;
+
+  diff.hasChanges = goAdded > 0 || goRemoved > 0 || goChanged > 0 || orChanged > 0;
+
+  if (diff.hasChanges) {
+    const parts: string[] = [];
+    if (goAdded > 0) parts.push(`+${goAdded} Go model${goAdded > 1 ? "s" : ""} added`);
+    if (goRemoved > 0) parts.push(`-${goRemoved} Go model${goRemoved > 1 ? "s" : ""} removed`);
+    if (goChanged > 0) parts.push(`${goChanged} Go limit change${goChanged > 1 ? "s" : ""}`);
+    if (orChanged > 0) parts.push(`${orChanged} OpenRouter price change${orChanged > 1 ? "s" : ""}`);
+    diff.summary = `OpenCode / OpenRouter changes detected: ${parts.join(", ")}. Run /go-diff to view.`;
+  } else {
+    diff.summary = "OpenCode Go & OpenRouter: no price changes detected.";
+  }
+
+  return diff;
+}
+
+/**
+ * Format a Markdown / console table showing Model, OpenCode Limit, OpenRouter Price, and Status.
+ */
+export function formatGoDiffTable(
+  todayCache?: CachedPrices,
+  prevCache?: CachedPrices,
+): string {
+  const cached = todayCache || loadTodayCache() || loadCache()?.raw;
+  if (!cached) {
+    return "No OpenCode Go pricing data available. Fetching may still be in flight.";
+  }
+
+  const previous =
+    prevCache !== undefined
+      ? prevCache
+      : loadPreviousCache(cached.date || dayStamp());
+  const diff = computePriceDiff(previous, cached);
+
+  const goModels = cached.opencode?.models || cached.models || {};
+  const orModels = cached.openrouter?.models || {};
+
+  // Build lookup for OpenRouter pricing by normalized model slug
+  const orByNorm = new Map<string, { id: string; price: OpenRouterPrice }>();
+  for (const [id, price] of Object.entries(orModels)) {
+    const slug = id.includes("/") ? id.split("/")[1] : id;
+    const norm = normId(slug);
+    if (!orByNorm.has(norm) || (!id.includes(":batch") && !id.includes(":free"))) {
+      orByNorm.set(norm, { id, price });
+    }
+  }
+
+  const addedSet = new Set(diff.opencode.added.map((m) => m.model));
+  const limitChangeMap = new Map(diff.opencode.changed.map((m) => [m.model, m]));
+  const orChangeMap = new Map(diff.openrouter.changed.map((m) => [m.model, m]));
+
+  const rows: string[][] = [];
+
+  for (const [modelKey, limit] of Object.entries(goModels)) {
+    const limitStr = limit === "unlimited" ? "unlimited" : `$${limit}`;
+    const norm = normId(modelKey);
+    const orEntry = orByNorm.get(norm);
+    const orPriceStr = orEntry
+      ? `$${orEntry.price.input.toFixed(4)} / $${orEntry.price.output.toFixed(4)}`
+      : "—";
+
+    let status = "unchanged";
+    if (addedSet.has(modelKey)) {
+      status = "added";
+    } else if (limitChangeMap.has(modelKey)) {
+      const c = limitChangeMap.get(modelKey)!;
+      const oldStr = c.oldLimit === "unlimited" ? "unlimited" : `$${c.oldLimit}`;
+      status = `limit: ${oldStr} -> ${limitStr}`;
+    } else if (orEntry && orChangeMap.has(orEntry.id)) {
+      const orc = orChangeMap.get(orEntry.id)!;
+      status = `OR price: $${orc.oldPrice.input.toFixed(4)}/$${orc.oldPrice.output.toFixed(4)} -> $${orc.newPrice.input.toFixed(4)}/$${orc.newPrice.output.toFixed(4)}`;
+    }
+
+    rows.push([modelKey, limitStr, orPriceStr, status]);
+  }
+
+  for (const rem of diff.opencode.removed) {
+    const limitStr = rem.limit === "unlimited" ? "unlimited" : `$${rem.limit}`;
+    rows.push([rem.model, limitStr, "—", "removed"]);
+  }
+
+  rows.sort((a, b) => a[0].localeCompare(b[0]));
+
+  const headers = ["Model", "OpenCode Limit", "OpenRouter Price (Input / Output per 1M)", "Status"];
+  const colWidths = headers.map((h, i) =>
+    Math.max(h.length, ...rows.map((r) => (r[i] ?? "").length)),
+  );
+  const sep = colWidths.map((w) => "-".repeat(w)).join("-+-");
+  const headerLine = headers.map((h, i) => h.padEnd(colWidths[i])).join(" | ");
+  const rowLines = rows.map((r) =>
+    r.map((cell, i) => (cell ?? "").padEnd(colWidths[i])).join(" | "),
+  );
+
+  const title = `=== OpenCode Go & OpenRouter Pricing (${cached.date}) ===\n`;
+  const summaryLine = diff.summary ? `Summary: ${diff.summary}\n\n` : "\n";
+  return title + summaryLine + [headerLine, sep, ...rowLines].join("\n");
+}
+
+/**
+ * Fetch market pricing from public OpenRouter API.
+ * Free, unauthenticated, timeout 5s, catches errors gracefully.
+ */
+function fetchOpenRouterPricing(): Promise<Record<string, OpenRouterPrice>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  return fetch(OPENROUTER_MODELS_URL, { signal: controller.signal })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((data) => parseOpenRouterPricing(data))
+    .catch(() => ({}))
+    .finally(() => clearTimeout(timer));
 }
 
 /** pi theme has no orange — raw ANSI 256 color 208 (orange) for unlimited. */
@@ -357,7 +624,7 @@ export default function (pi: ExtensionAPI) {
   let goStale = false; // values came from an older cache file
   let goFetchFailed = false; // today's fetch failed (offline / 404 / layout change)
   let goFetching = false;
-  let lastCtx: { model?: unknown; thinkingLevel?: string } | undefined;
+  let lastCtx: (CtxLike & { thinkingLevel?: string; ui?: any }) | undefined;
 
   function isGoModel(provider: string | undefined): boolean {
     return (provider || "").toLowerCase().includes("opencode-go");
@@ -480,43 +747,91 @@ export default function (pi: ExtensionAPI) {
   });
 
   /** Background fetch of today's limits; re-renders the status when done. */
-  function fetchGoPrices(): void {
+  async function fetchGoPrices(): Promise<void> {
     if (goFetching) return;
     // A session that claims to be local-only makes no outbound request of its own, and pi's
     // own code is offline-aware (`process.env.PI_OFFLINE`), so honour both.
     if (localOnly || process.env.PI_OFFLINE) return;
     goFetching = true;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    fetch(GO_DOCS_URL, { signal: controller.signal })
-      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((html) => {
-        const models = parseLimits(html);
-        if (Object.keys(models).length > 0) {
-          goPrices = models;
-          goStale = false;
-          goFetchFailed = false;
-          try {
-            writeFileSync(
-              cachePath(dayStamp()),
-              JSON.stringify({ date: dayStamp(), source: GO_DOCS_URL, models }),
-            );
-          } catch {
-            // cache write is best-effort only
-          }
-          if (lastCtx) updateStatus(lastCtx);
+    const goController = new AbortController();
+    const goTimer = setTimeout(() => goController.abort(), 15000);
+
+    try {
+      const [html, orPricing] = await Promise.all([
+        fetch(GO_DOCS_URL, { signal: goController.signal })
+          .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+          .finally(() => clearTimeout(goTimer)),
+        fetchOpenRouterPricing(),
+      ]);
+
+      const models = parseLimits(html);
+      if (Object.keys(models).length > 0) {
+        goPrices = models;
+        goStale = false;
+        goFetchFailed = false;
+
+        const prevCache = loadPreviousCache(dayStamp());
+        const todayData: CachedPrices = {
+          date: dayStamp(),
+          source: GO_DOCS_URL,
+          models,
+          opencode: { models },
+          openrouter: { models: orPricing },
+        };
+
+        try {
+          writeFileSync(
+            cachePath(dayStamp()),
+            JSON.stringify(todayData, null, 2),
+            "utf8",
+          );
+        } catch {
+          // cache write is best-effort only
         }
-      })
-      .catch(() => {
-        // offline / 404 / layout change — keep whatever older cache was loaded, mark it
-        // stale and surface the failure in the status line instead of hiding the segment.
-        goFetchFailed = true;
+
+        const diff = computePriceDiff(prevCache, todayData);
+        if (diff.hasChanges) {
+          const flag = flagPath(dayStamp());
+          if (!existsSync(flag)) {
+            try {
+              writeFileSync(flag, new Date().toISOString(), "utf8");
+            } catch {
+              // flag write is best-effort only
+            }
+            if (lastCtx?.ui?.notify) {
+              lastCtx.ui.notify(diff.summary, "info");
+            }
+          }
+        }
+
         if (lastCtx) updateStatus(lastCtx);
-      })
-      .finally(() => {
-        clearTimeout(timer);
-        goFetching = false;
-      });
+      }
+    } catch {
+      // offline / 404 / layout change — keep whatever older cache was loaded, mark it
+      // stale and surface the failure in the status line instead of hiding the segment.
+      goFetchFailed = true;
+      if (lastCtx) updateStatus(lastCtx);
+    } finally {
+      clearTimeout(goTimer);
+      goFetching = false;
+    }
+  }
+
+  function checkDailyNotification(ctx: { ui?: { notify?: (m: string, l?: string) => void } }): void {
+    const flag = flagPath(dayStamp());
+    if (existsSync(flag)) return;
+    const todayData = loadTodayCache();
+    if (!todayData) return;
+    const prevCache = loadPreviousCache(dayStamp());
+    const diff = computePriceDiff(prevCache, todayData);
+    if (diff.hasChanges) {
+      try {
+        writeFileSync(flag, new Date().toISOString(), "utf8");
+      } catch {
+        // best-effort
+      }
+      ctx.ui?.notify?.(diff.summary, "info");
+    }
   }
 
   /** Monthly limit for a go model, or undefined when unknown/not go. */
@@ -527,6 +842,7 @@ export default function (pi: ExtensionAPI) {
       if (cached) {
         goPrices = cached.models;
         goStale = cached.stale;
+        if (cached.stale) fetchGoPrices();
       } else {
         fetchGoPrices();
       }
@@ -639,6 +955,14 @@ export default function (pi: ExtensionAPI) {
       // `ctx.model` (getter on the handler context) — NOT `ctx.getModel()`, which is an
       // internal action and is undefined on handlers.
       enforceLocalOnly((ctx as CtxLike).model, ctx as CtxLike);
+    }
+    if (!localOnly && !process.env.PI_OFFLINE && (ctx as CtxLike).mode === "tui") {
+      const today = cachePath(dayStamp());
+      if (existsSync(today)) {
+        checkDailyNotification(ctx as CtxLike);
+      } else {
+        fetchGoPrices();
+      }
     }
     updateStatus(ctx);
   });
@@ -854,6 +1178,32 @@ export default function (pi: ExtensionAPI) {
         `${label} → zone ${zone}${overrides ? ` (override: ${overrides})` : ""}${localInfo}${goInfo}`,
         localOnly && !modelLocal(model) ? "error" : zone === "red" ? "error" : zone === "yellow" ? "warning" : "info",
       );
+    },
+  });
+
+  // OpenCode Go and OpenRouter diff: /go-diff
+  pi.registerCommand("go-diff", {
+    description: "Show OpenCode Go limits, OpenRouter market pricing, and daily diff table",
+    handler: async (_args, ctx) => {
+      let todayData = loadTodayCache();
+      if (!todayData) {
+        fetchGoPrices();
+        const fallback = loadCache();
+        if (fallback?.raw) {
+          todayData = fallback.raw;
+        }
+      }
+      if (!todayData) {
+        const msg = "No pricing data available yet. Fetching in progress...";
+        console.log(msg);
+        ctx?.ui?.notify?.(msg, "info");
+        return;
+      }
+      const table = formatGoDiffTable(todayData);
+      console.log(table);
+      if (ctx?.ui?.notify) {
+        ctx.ui.notify("OpenCode Go / OpenRouter diff table printed to console", "info");
+      }
     },
   });
 }
