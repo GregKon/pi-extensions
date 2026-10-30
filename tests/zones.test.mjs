@@ -312,6 +312,7 @@ test("parseOpenRouterPricing parses token pricing per 1M tokens", () => {
 
 test("computePriceDiff handles initial cache with no previous cache", () => {
   const current = {
+    schemaVersion: 2,
     date: "2026-10-21",
     opencode: { models: { "glm5.3flash": 60 } },
     openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.0412, output: 0.12 } } },
@@ -322,11 +323,13 @@ test("computePriceDiff handles initial cache with no previous cache", () => {
 
 test("computePriceDiff detects added, removed, and changed OpenCode limits", () => {
   const previous = {
+    schemaVersion: 2,
     date: "2026-10-20",
     opencode: { models: { "glm5.3flash": 15, "oldmodel": 15 } },
     openrouter: { models: {} },
   };
   const current = {
+    schemaVersion: 2,
     date: "2026-10-21",
     opencode: { models: { "glm5.3flash": 60, "newmodel": 60 } },
     openrouter: { models: {} },
@@ -337,10 +340,10 @@ test("computePriceDiff detects added, removed, and changed OpenCode limits", () 
   assert.equal(diff.opencode.added[0].model, "newmodel");
   assert.equal(diff.opencode.removed.length, 1);
   assert.equal(diff.opencode.removed[0].model, "oldmodel");
-  assert.equal(diff.opencode.changed.length, 1);
-  assert.equal(diff.opencode.changed[0].model, "glm5.3flash");
-  assert.equal(diff.opencode.changed[0].oldLimit, 15);
-  assert.equal(diff.opencode.changed[0].newLimit, 60);
+  assert.equal(diff.opencode.limitChanged.length, 1);
+  assert.equal(diff.opencode.limitChanged[0].model, "glm5.3flash");
+  assert.equal(diff.opencode.limitChanged[0].oldLimit, 15);
+  assert.equal(diff.opencode.limitChanged[0].newLimit, 60);
   assert.match(diff.summary, /\+1 Go model added/);
   assert.match(diff.summary, /-1 Go model removed/);
   assert.match(diff.summary, /1 Go limit change/);
@@ -348,11 +351,13 @@ test("computePriceDiff detects added, removed, and changed OpenCode limits", () 
 
 test("computePriceDiff detects OpenRouter pricing changes", () => {
   const previous = {
+    schemaVersion: 2,
     date: "2026-10-20",
     opencode: { models: { "glm5.3flash": 60 } },
     openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.05, output: 0.15 } } },
   };
   const current = {
+    schemaVersion: 2,
     date: "2026-10-21",
     opencode: { models: { "glm5.3flash": 60 } },
     openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.0412, output: 0.12 } } },
@@ -368,24 +373,223 @@ test("computePriceDiff detects OpenRouter pricing changes", () => {
 
 test("formatGoDiffTable formats a table with required columns", () => {
   const current = {
+    schemaVersion: 2,
     date: "2026-10-21",
     opencode: { models: { "glm5.3flash": 60 } },
     openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.0412, output: 0.12 } } },
   };
   const previous = {
+    schemaVersion: 2,
     date: "2026-10-20",
     opencode: { models: { "glm5.3flash": 15 } },
     openrouter: { models: { "z-ai/glm-5.3-flash": { input: 0.05, output: 0.15 } } },
   };
   const table = mod.formatGoDiffTable(current, previous);
   assert.match(table, /Model/);
-  assert.match(table, /OpenCode Limit/);
-  assert.match(table, /OpenRouter Price \(Input \/ Output per 1M\)/);
+  assert.match(table, /Go Limit/);
+  assert.match(table, /Go In\/Out/);
+  assert.match(table, /Go Cache/);
+  assert.match(table, /OR In\/Out/);
   assert.match(table, /Status/);
   assert.match(table, /glm5\.3flash/);
   assert.match(table, /\$60/);
-  assert.match(table, /\$0\.0412 \/ \$0\.1200/);
-  assert.match(table, /limit: \$15 -> \$60/);
+  assert.match(table, /—\/—/);
+  assert.match(table, /\$0\.041\/\$0\.120/);
+  assert.match(table, /limit \$15>\$60/);
+});
+
+test("parseGoPricing parses only first panel (Go) and ignores Go Plus", () => {
+  const html = `
+    <div>
+      <h2>Go Panel</h2>
+      <table>
+        <thead>
+          <tr><th>Model</th><th>Input</th><th>Output</th><th>Cached Read</th><th>Cached Write</th><th>Monthly limit</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>GLM-5.3-Flash</td>
+            <td>$0.15</td>
+            <td>$0.50</td>
+            <td>$0.03</td>
+            <td>-</td>
+            <td><strong>$60</strong></td>
+          </tr>
+        </tbody>
+      </table>
+      <h2>Go Plus Panel</h2>
+      <table>
+        <thead>
+          <tr><th>Model</th><th>Input</th><th>Output</th><th>Cached Read</th><th>Cached Write</th><th>Monthly limit</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>GLM-5.3-Flash</td>
+            <td>$0.15</td>
+            <td>$0.50</td>
+            <td>$0.03</td>
+            <td>-</td>
+            <td><strong>$180</strong></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  `;
+  const { flatLimits, fullModels } = mod.parseGoPricing(html);
+  assert.equal(flatLimits["glm5.3flash"], 60, "Must parse Go limit ($60), not Go Plus ($180)");
+  assert.ok(fullModels["GLM-5.3-Flash"]);
+  assert.equal(fullModels["GLM-5.3-Flash"].limit, 60);
+  assert.deepEqual(fullModels["GLM-5.3-Flash"].price, {
+    input: 0.15,
+    output: 0.5,
+    cachedRead: 0.03,
+  });
+});
+
+test("computePriceDiff handles v1 to v2 migration with no limit changes", () => {
+  const prevV1 = {
+    date: "2026-10-20",
+    models: { "glm5.3flash": 60 },
+  };
+  const currV2 = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    models: { "glm5.3flash": 60 },
+    opencode: {
+      models: {
+        "GLM-5.3-Flash": { limit: 60, price: { input: 0.15, output: 0.5 } },
+      },
+    },
+    openrouter: {
+      models: {
+        "z-ai/glm-5.3-flash": { input: 0.04, output: 0.12 },
+      },
+    },
+  };
+  const diff = mod.computePriceDiff(prevV1, currV2);
+  assert.equal(diff.hasChanges, false);
+  assert.equal(diff.opencode.added.length, 0);
+  assert.equal(diff.opencode.removed.length, 0);
+  assert.equal(diff.opencode.limitChanged.length, 0);
+  assert.equal(diff.opencode.priceChanged.length, 0);
+  assert.equal(diff.openrouter.changed.length, 0);
+  assert.match(diff.summary, /baseline established/);
+});
+
+test("computePriceDiff handles v1 to v2 migration with limit change", () => {
+  const prevV1 = {
+    date: "2026-10-20",
+    models: { "glm5.3flash": 15 },
+  };
+  const currV2 = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    models: { "glm5.3flash": 60 },
+    opencode: {
+      models: {
+        "GLM-5.3-Flash": { limit: 60, price: { input: 0.15, output: 0.5 } },
+      },
+    },
+  };
+  const diff = mod.computePriceDiff(prevV1, currV2);
+  assert.equal(diff.hasChanges, true);
+  assert.equal(diff.opencode.limitChanged.length, 1);
+  assert.equal(diff.opencode.limitChanged[0].oldLimit, 15);
+  assert.equal(diff.opencode.limitChanged[0].newLimit, 60);
+  assert.match(diff.summary, /baseline established/);
+});
+
+test("formatGoDiffTable handles v1 cache data gracefully without TypeError", () => {
+  const prevV1 = {
+    date: "2026-10-20",
+    models: { "glm5.3flash": 60 },
+  };
+  const currV1 = {
+    date: "2026-10-21",
+    models: { "glm5.3flash": 60 },
+  };
+  const table = mod.formatGoDiffTable(currV1, prevV1);
+  assert.match(table, /glm5\.3flash/);
+  assert.match(table, /\$60/);
+  assert.match(table, /—\/—/);
+  assert.match(table, /ok/);
+});
+
+test("computePriceDiff ignores OpenRouter price changes for models outside Go offer", () => {
+  const previous = {
+    schemaVersion: 2,
+    date: "2026-10-20",
+    opencode: { models: { "GLM-5.3-Flash": { limit: 60 } } },
+    openrouter: {
+      models: {
+        "z-ai/glm-5.3-flash": { input: 0.05, output: 0.15 },
+        "anthropic/claude-3-opus": { input: 15, output: 75 },
+      },
+    },
+  };
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: { models: { "GLM-5.3-Flash": { limit: 60 } } },
+    openrouter: {
+      models: {
+        "z-ai/glm-5.3-flash": { input: 0.0412, output: 0.12 },
+        "anthropic/claude-3-opus": { input: 20, output: 80 },
+      },
+    },
+  };
+  const diff = mod.computePriceDiff(previous, current);
+  assert.equal(diff.hasChanges, true);
+  assert.equal(diff.openrouter.changed.length, 1);
+  assert.equal(diff.openrouter.changed[0].model, "z-ai/glm-5.3-flash");
+});
+
+test("formatGoDiffTable worst-case row width does not exceed 118 characters", () => {
+  const previous = {
+    schemaVersion: 2,
+    date: "2026-10-20",
+    opencode: {
+      models: {
+        "DeepSeek V4.1 Flash (Peak)": {
+          limit: 15,
+          price: { input: 0.15, output: 0.5, cachedRead: 0.03, cachedWrite: 2.5 },
+        },
+      },
+    },
+    openrouter: {
+      models: {
+        "deepseek/deepseek-v4.1-flash": { input: 0.005, output: 0.02 },
+      },
+    },
+  };
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "DeepSeek V4.1 Flash (Peak)": {
+          limit: 60,
+          price: { input: 0.2, output: 0.6, cachedRead: 0.04, cachedWrite: 2.8 },
+        },
+      },
+    },
+    openrouter: {
+      models: {
+        "deepseek/deepseek-v4.1-flash": { input: 0.006, output: 0.02 },
+      },
+    },
+  };
+  const table = mod.formatGoDiffTable(current, previous);
+  const lines = table.split("\n");
+  for (const line of lines) {
+    if (line.includes("|") || line.includes("-+-")) {
+      assert.ok(
+        line.length <= 118,
+        `Table row length ${line.length} exceeds 118 characters:\n${line}`,
+      );
+    }
+  }
+  assert.match(table, /Matched 1\/1 Go models to OpenRouter market pricing\./);
 });
 
 test("registers /go-diff slash command", async () => {

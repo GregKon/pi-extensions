@@ -198,17 +198,30 @@ const GO_DIFF_PREFIX = "opencode-go-diff-";
 
 export type GoLimit = number | "unlimited";
 
+export interface GoTokenPrice {
+  input: number; // USD per 1M tokens (0 for Free)
+  output: number; // USD per 1M tokens (0 for Free)
+  cachedRead?: number; // USD per 1M tokens (undefined for "-")
+  cachedWrite?: number; // USD per 1M tokens (undefined for "-")
+}
+
+export interface GoModelEntry {
+  limit: GoLimit;
+  price?: GoTokenPrice; // optional for v1 cache compatibility
+}
+
 export interface OpenRouterPrice {
   input: number; // USD per 1M tokens
   output: number; // USD per 1M tokens
 }
 
 export interface CachedPrices {
+  schemaVersion?: number; // 2 for new format with token prices
   date: string;
   source?: string;
-  models?: Record<string, GoLimit>;
+  models?: Record<string, GoLimit>; // flat fast lookup for footer limit: normId -> limit
   opencode?: {
-    models: Record<string, GoLimit>;
+    models: Record<string, GoModelEntry | GoLimit>; // union for backward compatibility
   };
   openrouter?: {
     models: Record<string, OpenRouterPrice>;
@@ -217,15 +230,35 @@ export interface CachedPrices {
 
 export interface PriceDiff {
   opencode: {
-    added: Array<{ model: string; limit: GoLimit }>;
-    removed: Array<{ model: string; limit: GoLimit }>;
-    changed: Array<{ model: string; oldLimit: GoLimit; newLimit: GoLimit }>;
+    added: Array<{ model: string; entry: GoModelEntry }>;
+    removed: Array<{ model: string; entry: GoModelEntry }>;
+    limitChanged: Array<{ model: string; oldLimit: GoLimit; newLimit: GoLimit }>;
+    priceChanged: Array<{
+      model: string;
+      oldPrice: GoTokenPrice;
+      newPrice: GoTokenPrice;
+    }>;
   };
   openrouter: {
     changed: Array<{ model: string; oldPrice: OpenRouterPrice; newPrice: OpenRouterPrice }>;
   };
   hasChanges: boolean;
   summary: string;
+}
+
+/** Normalize raw cache value (v1 number/unlimited or v2 GoModelEntry) to GoModelEntry. */
+export function toGoEntry(val: unknown): GoModelEntry {
+  if (typeof val === "number" || val === "unlimited") {
+    return { limit: val as GoLimit, price: undefined };
+  }
+  if (val && typeof val === "object") {
+    const entry = val as GoModelEntry;
+    return {
+      limit: entry.limit ?? "unlimited",
+      price: entry.price,
+    };
+  }
+  return { limit: "unlimited", price: undefined };
 }
 
 /** Current UTC day (YYYY-MM-DD), used as cache file stamp. */
@@ -259,9 +292,17 @@ function loadCache(): { models: Record<string, GoLimit>; stale: boolean; raw?: C
     for (const p of paths) {
       if (!existsSync(p)) continue;
       const json = JSON.parse(readFileSync(p, "utf8")) as CachedPrices;
-      const models = json.opencode?.models || json.models;
-      if (models && Object.keys(models).length > 0) {
-        return { models, stale: p !== today, raw: json };
+      let flatLimits: Record<string, GoLimit> = json.models || {};
+      if (Object.keys(flatLimits).length === 0 && json.opencode?.models) {
+        flatLimits = Object.fromEntries(
+          Object.entries(json.opencode.models).map(([k, v]) => [
+            normId(k),
+            toGoEntry(v).limit,
+          ]),
+        );
+      }
+      if (Object.keys(flatLimits).length > 0) {
+        return { models: flatLimits, stale: p !== today, raw: json };
       }
     }
   } catch {
@@ -317,37 +358,136 @@ function normId(name: string): string {
   return s;
 }
 
+function parsePriceValue(cell: string): number | undefined {
+  if (!cell) return undefined;
+  const strongUsd = cell.match(/<strong>\s*\$([\d.]+)/);
+  if (strongUsd) return parseFloat(strongUsd[1]);
+  const normalUsd = cell.match(/\$([\d.]+)/);
+  if (normalUsd) return parseFloat(normalUsd[1]);
+  const text = cell.replace(/<[^>]+>/g, "").trim();
+  if (/^free$/i.test(text) || /free/i.test(cell)) return 0;
+  return undefined;
+}
+
+function parseLimitValue(cell: string): GoLimit | undefined {
+  if (!cell) return undefined;
+  const strongUsd = cell.match(/<strong>\s*\$([\d.]+)/);
+  if (strongUsd) return parseFloat(strongUsd[1]);
+  if (/<strong>\s*unlimited/i.test(cell)) return "unlimited";
+  const normalUsd = cell.match(/\$([\d.]+)/);
+  if (normalUsd) return parseFloat(normalUsd[1]);
+  if (/unlimited/i.test(cell)) return "unlimited";
+  return undefined;
+}
+
+/**
+ * Parse Go pricing table from docs HTML, isolating the first panel ("Go" panel)
+ * and ignoring subsequent panels like "Go Plus".
+ */
+export function parseGoPricing(html: string): {
+  flatLimits: Record<string, GoLimit>;
+  fullModels: Record<string, GoModelEntry>;
+} {
+  const flatLimits: Record<string, GoLimit> = {};
+  const fullModels: Record<string, GoModelEntry> = {};
+
+  if (!html) return { flatLimits, fullModels };
+
+  const tableMatches = html.match(/<table[\s\S]*?<\/table>/gi);
+  if (!tableMatches) return { flatLimits, fullModels };
+
+  let targetTable: string | null = null;
+  let targetCleanTh: string[] = [];
+
+  for (const tableHtml of tableMatches) {
+    const thMatches = [...tableHtml.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi)].map((m) => m[1]);
+    const cleanTh = thMatches.map((th) =>
+      th.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().toLowerCase(),
+    );
+    const hasModel = cleanTh.some((h) => h.includes("model"));
+    const hasLimit = cleanTh.some((h) => h.includes("limit"));
+    if (hasModel && hasLimit) {
+      targetTable = tableHtml;
+      targetCleanTh = cleanTh;
+      break;
+    }
+  }
+
+  if (!targetTable) return { flatLimits, fullModels };
+
+  let modelIdx = -1;
+  let inputIdx = -1;
+  let outputIdx = -1;
+  let cachedReadIdx = -1;
+  let cachedWriteIdx = -1;
+  let limitIdx = -1;
+
+  for (let i = 0; i < targetCleanTh.length; i++) {
+    const h = targetCleanTh[i];
+    if (h.includes("cached read")) {
+      cachedReadIdx = i;
+    } else if (h.includes("cached write")) {
+      cachedWriteIdx = i;
+    } else if (h.includes("input")) {
+      inputIdx = i;
+    } else if (h.includes("output")) {
+      outputIdx = i;
+    } else if (h.includes("limit")) {
+      limitIdx = i;
+    } else if (h.includes("model")) {
+      modelIdx = i;
+    }
+  }
+
+  if (modelIdx === -1) modelIdx = 0;
+
+  const rowMatches = targetTable.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
+  for (const row of rowMatches) {
+    const cells = [...row[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => m[1]);
+    if (cells.length < 2) continue;
+
+    const nameCell = cells[modelIdx] ?? cells[0] ?? "";
+    const name = nameCell.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    if (!name) continue;
+
+    const limitCell =
+      limitIdx !== -1 && cells[limitIdx] !== undefined
+        ? cells[limitIdx]
+        : cells[cells.length - 1];
+    const limit = parseLimitValue(limitCell);
+    if (limit === undefined) continue;
+
+    let price: GoTokenPrice | undefined;
+    if (inputIdx !== -1 && outputIdx !== -1) {
+      const inVal = parsePriceValue(cells[inputIdx] ?? "");
+      const outVal = parsePriceValue(cells[outputIdx] ?? "");
+      if (inVal !== undefined && outVal !== undefined) {
+        price = { input: inVal, output: outVal };
+        if (cachedReadIdx !== -1) {
+          const crVal = parsePriceValue(cells[cachedReadIdx] ?? "");
+          if (crVal !== undefined) price.cachedRead = crVal;
+        }
+        if (cachedWriteIdx !== -1) {
+          const cwVal = parsePriceValue(cells[cachedWriteIdx] ?? "");
+          if (cwVal !== undefined) price.cachedWrite = cwVal;
+        }
+      }
+    }
+
+    const entry: GoModelEntry = { limit, price };
+    fullModels[name] = entry;
+    flatLimits[normId(name)] = limit;
+  }
+
+  return { flatLimits, fullModels };
+}
+
 /**
  * Parse the "Usage limits" table out of the docs HTML.
- * Row shape: <tr><td>Name</td><td>...</td><td>LIMIT</td></tr>
- * LIMIT shape: <strong>$60</strong> | <del>$15</del> <strong>$60</strong><br><small>promo</small>
- *            | <strong>Unlimited</strong><br><small>limited time</small>
- * Promo rows keep both struck-through and current values — take the <strong> one.
+ * Kept 100% backward-compatible: returns flat map normId(name) -> limit.
  */
 export function parseLimits(html: string): Record<string, GoLimit> {
-  const models: Record<string, GoLimit> = {};
-  const table = html.match(/<table><thead><tr><th>Model<\/th>.*?<\/table>/s);
-  if (!table) return {};
-  const body = table[0];
-  const rows = body.matchAll(/<tr>([\s\S]*?)<\/tr>/g);
-  for (const row of rows) {
-    const cells = [...row[1].matchAll(/<td>([\s\S]*?)<\/td>/g)].map((m) => m[1]);
-    if (cells.length < 2) continue;
-    const name = cells[0].replace(/<[^>]+>/g, "").trim();
-    const limitCell = cells[cells.length - 1];
-    let limit: GoLimit | undefined;
-    const strongUsd = limitCell.match(/<strong>\s*\$([\d.]+)/);
-    if (strongUsd) {
-      limit = parseFloat(strongUsd[1]);
-    } else if (/<strong>\s*unlimited/i.test(limitCell)) {
-      limit = "unlimited";
-    } else {
-      const usd = limitCell.match(/\$([\d.]+)/);
-      if (usd) limit = parseFloat(usd[1]);
-    }
-    if (limit !== undefined && name) models[normId(name)] = limit;
-  }
-  return models;
+  return parseGoPricing(html).flatLimits;
 }
 
 /**
@@ -387,7 +527,7 @@ export function computePriceDiff(
   curr: CachedPrices,
 ): PriceDiff {
   const diff: PriceDiff = {
-    opencode: { added: [], removed: [], changed: [] },
+    opencode: { added: [], removed: [], limitChanged: [], priceChanged: [] },
     openrouter: { changed: [] },
     hasChanges: false,
     summary: "",
@@ -398,48 +538,121 @@ export function computePriceDiff(
     return diff;
   }
 
-  const prevGo = prev.opencode?.models || prev.models || {};
-  const currGo = curr.opencode?.models || curr.models || {};
+  const isV2Migration = prev.schemaVersion !== 2 || curr.schemaVersion !== 2;
+
+  if (isV2Migration) {
+    const prevLimits: Record<string, GoLimit> = {};
+    const currLimits: Record<string, GoLimit> = {};
+
+    const prevSource = prev.models || prev.opencode?.models || {};
+    for (const [k, v] of Object.entries(prevSource)) {
+      prevLimits[normId(k)] = toGoEntry(v).limit;
+    }
+
+    const currSource = curr.models || curr.opencode?.models || {};
+    for (const [k, v] of Object.entries(currSource)) {
+      currLimits[normId(k)] = toGoEntry(v).limit;
+    }
+
+    for (const [model, newLimit] of Object.entries(currLimits)) {
+      if (model in prevLimits) {
+        const oldLimit = prevLimits[model];
+        if (oldLimit !== newLimit) {
+          diff.opencode.limitChanged.push({ model, oldLimit, newLimit });
+        }
+      }
+    }
+
+    if (diff.opencode.limitChanged.length > 0) {
+      diff.hasChanges = true;
+      const count = diff.opencode.limitChanged.length;
+      diff.summary = `OpenCode Go price baseline established (schema v2); ${count} Go limit change${count > 1 ? "s" : ""} detected.`;
+    } else {
+      diff.hasChanges = false;
+      diff.summary = "OpenCode Go price baseline established (schema v2); diffing active from next update.";
+    }
+
+    return diff;
+  }
+
+  // Schema v2 diffing
+  const prevGoRaw = prev.opencode?.models || prev.models || {};
+  const currGoRaw = curr.opencode?.models || curr.models || {};
   const prevOR = prev.openrouter?.models || {};
   const currOR = curr.openrouter?.models || {};
 
-  // OpenCode Go changes
-  for (const [model, limit] of Object.entries(currGo)) {
+  const prevGo: Record<string, GoModelEntry> = {};
+  for (const [k, v] of Object.entries(prevGoRaw)) {
+    prevGo[k] = toGoEntry(v);
+  }
+
+  const currGo: Record<string, GoModelEntry> = {};
+  for (const [k, v] of Object.entries(currGoRaw)) {
+    currGo[k] = toGoEntry(v);
+  }
+
+  for (const [model, entry] of Object.entries(currGo)) {
     if (!(model in prevGo)) {
-      diff.opencode.added.push({ model, limit });
-    } else if (prevGo[model] !== limit) {
-      diff.opencode.changed.push({ model, oldLimit: prevGo[model], newLimit: limit });
+      diff.opencode.added.push({ model, entry });
+    } else {
+      const oldEntry = prevGo[model];
+      if (oldEntry.limit !== entry.limit) {
+        diff.opencode.limitChanged.push({ model, oldLimit: oldEntry.limit, newLimit: entry.limit });
+      }
+      if (oldEntry.price !== undefined && entry.price !== undefined) {
+        const op = oldEntry.price;
+        const np = entry.price;
+        if (
+          op.input !== np.input ||
+          op.output !== np.output ||
+          op.cachedRead !== np.cachedRead ||
+          op.cachedWrite !== np.cachedWrite
+        ) {
+          diff.opencode.priceChanged.push({
+            model,
+            oldPrice: op,
+            newPrice: np,
+          });
+        }
+      }
     }
   }
 
-  for (const [model, limit] of Object.entries(prevGo)) {
+  for (const [model, entry] of Object.entries(prevGo)) {
     if (!(model in currGo)) {
-      diff.opencode.removed.push({ model, limit });
+      diff.opencode.removed.push({ model, entry });
     }
   }
 
-  // OpenRouter changes: model pricing changes
-  for (const [model, price] of Object.entries(currOR)) {
-    if (model in prevOR) {
-      const old = prevOR[model];
+  // OpenRouter changes: narrow to Go models only
+  const goNormIds = new Set(Object.keys(currGo).map((name) => normId(name)));
+
+  for (const [id, price] of Object.entries(currOR)) {
+    const slug = id.split("/")[1] ?? id;
+    if (!goNormIds.has(normId(slug))) continue;
+    if (id in prevOR) {
+      const old = prevOR[id];
       if (old.input !== price.input || old.output !== price.output) {
-        diff.openrouter.changed.push({ model, oldPrice: old, newPrice: price });
+        diff.openrouter.changed.push({ model: id, oldPrice: old, newPrice: price });
       }
     }
   }
 
   const goAdded = diff.opencode.added.length;
   const goRemoved = diff.opencode.removed.length;
-  const goChanged = diff.opencode.changed.length;
+  const goLimitChanged = diff.opencode.limitChanged.length;
+  const goPriceChanged = diff.opencode.priceChanged.length;
   const orChanged = diff.openrouter.changed.length;
 
-  diff.hasChanges = goAdded > 0 || goRemoved > 0 || goChanged > 0 || orChanged > 0;
+  diff.hasChanges =
+    goAdded > 0 || goRemoved > 0 || goLimitChanged > 0 || goPriceChanged > 0 || orChanged > 0;
 
   if (diff.hasChanges) {
     const parts: string[] = [];
     if (goAdded > 0) parts.push(`+${goAdded} Go model${goAdded > 1 ? "s" : ""} added`);
     if (goRemoved > 0) parts.push(`-${goRemoved} Go model${goRemoved > 1 ? "s" : ""} removed`);
-    if (goChanged > 0) parts.push(`${goChanged} Go limit change${goChanged > 1 ? "s" : ""}`);
+    if (goLimitChanged > 0) parts.push(`${goLimitChanged} Go limit change${goLimitChanged > 1 ? "s" : ""}`);
+    if (goPriceChanged > 0) parts.push(`${goPriceChanged} Go price change${goPriceChanged > 1 ? "s" : ""}`);
     if (orChanged > 0) parts.push(`${orChanged} OpenRouter price change${orChanged > 1 ? "s" : ""}`);
     diff.summary = `OpenCode / OpenRouter changes detected: ${parts.join(", ")}. Run /go-diff to view.`;
   } else {
@@ -449,8 +662,44 @@ export function computePriceDiff(
   return diff;
 }
 
+function truncateModelName(name: string, maxLen = 24): string {
+  if (name.length <= maxLen) return name;
+  const match = name.match(/^(.*?)(\s*\([^)]+\))$/);
+  if (match) {
+    const base = match[1].trim();
+    const paren = match[2].trim();
+    if (paren.length + 4 > maxLen) {
+      return name.slice(0, maxLen - 1) + "…";
+    }
+    const availBase = maxLen - paren.length - 1;
+    const truncatedBase = base.slice(0, availBase).trimEnd();
+    return `${truncatedBase}…${paren}`;
+  }
+  return name.slice(0, maxLen - 1) + "…";
+}
+
+function formatSingleTokenPrice(val: number | undefined): string {
+  if (val === undefined) return "—";
+  if (val === 0) return "Free";
+  if (val >= 10) {
+    return `$${val.toFixed(2)}`;
+  }
+  return `$${val.toFixed(3)}`;
+}
+
+function formatTokenNum(v: number | undefined): string {
+  if (v === undefined) return "—";
+  if (v === 0) return "0";
+  if (v < 0.01) return v.toFixed(3);
+  return v.toFixed(2);
+}
+
+function fmtLimit(l: GoLimit): string {
+  return l === "unlimited" ? "unl" : `$${l}`;
+}
+
 /**
- * Format a Markdown / console table showing Model, OpenCode Limit, OpenRouter Price, and Status.
+ * Format a Markdown / console table showing Model, Go Limit, Go In/Out, Go Cache, OR In/Out, and Status.
  */
 export function formatGoDiffTable(
   todayCache?: CachedPrices,
@@ -475,48 +724,109 @@ export function formatGoDiffTable(
   for (const [id, price] of Object.entries(orModels)) {
     const slug = id.includes("/") ? id.split("/")[1] : id;
     const norm = normId(slug);
-    if (!orByNorm.has(norm) || (!id.includes(":batch") && !id.includes(":free"))) {
+    if (!orByNorm.has(norm) || (!id.includes(":") && orByNorm.get(norm)!.id.includes(":"))) {
       orByNorm.set(norm, { id, price });
     }
   }
 
   const addedSet = new Set(diff.opencode.added.map((m) => m.model));
-  const limitChangeMap = new Map(diff.opencode.changed.map((m) => [m.model, m]));
+  const limitChangeMap = new Map(diff.opencode.limitChanged.map((m) => [m.model, m]));
+  const priceChangeMap = new Map(diff.opencode.priceChanged.map((m) => [m.model, m]));
   const orChangeMap = new Map(diff.openrouter.changed.map((m) => [m.model, m]));
 
   const rows: string[][] = [];
+  let matchedCount = 0;
+  const totalGoModels = Object.keys(goModels).length;
 
-  for (const [modelKey, limit] of Object.entries(goModels)) {
-    const limitStr = limit === "unlimited" ? "unlimited" : `$${limit}`;
+  for (const [modelKey, rawEntry] of Object.entries(goModels)) {
+    const entry = toGoEntry(rawEntry);
+    const limitStr = entry.limit === "unlimited" ? "unlimited" : `$${entry.limit}`;
     const norm = normId(modelKey);
     const orEntry = orByNorm.get(norm);
-    const orPriceStr = orEntry
-      ? `$${orEntry.price.input.toFixed(4)} / $${orEntry.price.output.toFixed(4)}`
-      : "—";
+    if (orEntry) matchedCount++;
 
-    let status = "unchanged";
-    if (addedSet.has(modelKey)) {
-      status = "added";
-    } else if (limitChangeMap.has(modelKey)) {
-      const c = limitChangeMap.get(modelKey)!;
-      const oldStr = c.oldLimit === "unlimited" ? "unlimited" : `$${c.oldLimit}`;
-      status = `limit: ${oldStr} -> ${limitStr}`;
-    } else if (orEntry && orChangeMap.has(orEntry.id)) {
-      const orc = orChangeMap.get(orEntry.id)!;
-      status = `OR price: $${orc.oldPrice.input.toFixed(4)}/$${orc.oldPrice.output.toFixed(4)} -> $${orc.newPrice.input.toFixed(4)}/$${orc.newPrice.output.toFixed(4)}`;
+    const inOutStr = entry.price
+      ? `${formatSingleTokenPrice(entry.price.input)}/${formatSingleTokenPrice(entry.price.output)}`
+      : "—/—";
+
+    let cacheStr = "—/—";
+    if (entry.price) {
+      if (entry.price.cachedRead !== undefined || entry.price.cachedWrite !== undefined) {
+        const crStr = formatSingleTokenPrice(entry.price.cachedRead);
+        const cwStr = formatSingleTokenPrice(entry.price.cachedWrite);
+        cacheStr = `${crStr}/${cwStr}`;
+      } else {
+        cacheStr = "—/—";
+      }
     }
 
-    rows.push([modelKey, limitStr, orPriceStr, status]);
+    const orPriceStr = orEntry
+      ? `${formatSingleTokenPrice(orEntry.price.input)}/${formatSingleTokenPrice(orEntry.price.output)}`
+      : "—";
+
+    let status = "ok";
+    if (addedSet.has(modelKey)) {
+      status = "added";
+    } else {
+      const tokens: string[] = [];
+      const lc = limitChangeMap.get(modelKey) ?? limitChangeMap.get(norm);
+      if (lc) {
+        tokens.push(`limit ${fmtLimit(lc.oldLimit)}>${fmtLimit(lc.newLimit)}`);
+      }
+      const pc = priceChangeMap.get(modelKey);
+      if (pc) {
+        if (pc.oldPrice.input !== pc.newPrice.input) {
+          tokens.push(`in ${formatTokenNum(pc.oldPrice.input)}>${formatTokenNum(pc.newPrice.input)}`);
+        }
+        if (pc.oldPrice.output !== pc.newPrice.output) {
+          tokens.push(`out ${formatTokenNum(pc.oldPrice.output)}>${formatTokenNum(pc.newPrice.output)}`);
+        }
+        if (pc.oldPrice.cachedRead !== pc.newPrice.cachedRead) {
+          tokens.push(`cr ${formatTokenNum(pc.oldPrice.cachedRead)}>${formatTokenNum(pc.newPrice.cachedRead)}`);
+        }
+        if (pc.oldPrice.cachedWrite !== pc.newPrice.cachedWrite) {
+          tokens.push(`cw ${formatTokenNum(pc.oldPrice.cachedWrite)}>${formatTokenNum(pc.newPrice.cachedWrite)}`);
+        }
+      }
+      if (orEntry && orChangeMap.has(orEntry.id)) {
+        const orc = orChangeMap.get(orEntry.id)!;
+        if (orc.oldPrice.input !== orc.newPrice.input) {
+          tokens.push(`OR ${formatTokenNum(orc.oldPrice.input)}>${formatTokenNum(orc.newPrice.input)}`);
+        } else if (orc.oldPrice.output !== orc.newPrice.output) {
+          tokens.push(`OR ${formatTokenNum(orc.oldPrice.output)}>${formatTokenNum(orc.newPrice.output)}`);
+        }
+      }
+
+      if (tokens.length === 0) {
+        status = "ok";
+      } else if (tokens.length === 1) {
+        status = tokens[0].length <= 29 ? tokens[0] : `${tokens[0].slice(0, 28)}…`;
+      } else if (tokens.length === 2) {
+        const pair = tokens.join("; ");
+        status = pair.length <= 29 ? pair : `${tokens[0]}…`;
+      } else {
+        status = `${tokens[0]}…`;
+      }
+    }
+
+    rows.push([truncateModelName(modelKey), limitStr, inOutStr, cacheStr, orPriceStr, status]);
   }
 
   for (const rem of diff.opencode.removed) {
-    const limitStr = rem.limit === "unlimited" ? "unlimited" : `$${rem.limit}`;
-    rows.push([rem.model, limitStr, "—", "removed"]);
+    const remEntry = toGoEntry(rem.entry ?? (rem as unknown as { limit?: GoLimit }).limit);
+    const limitStr = remEntry.limit === "unlimited" ? "unlimited" : `$${remEntry.limit}`;
+    const inOutStr = remEntry.price
+      ? `${formatSingleTokenPrice(remEntry.price.input)}/${formatSingleTokenPrice(remEntry.price.output)}`
+      : "—/—";
+    const cacheStr = remEntry.price
+      ? `${formatSingleTokenPrice(remEntry.price.cachedRead)}/${formatSingleTokenPrice(remEntry.price.cachedWrite)}`
+      : "—/—";
+    rows.push([truncateModelName(rem.model), limitStr, inOutStr, cacheStr, "—", "removed"]);
   }
 
   rows.sort((a, b) => a[0].localeCompare(b[0]));
 
-  const headers = ["Model", "OpenCode Limit", "OpenRouter Price (Input / Output per 1M)", "Status"];
+  const headers = ["Model", "Go Limit", "Go In/Out", "Go Cache", "OR In/Out", "Status"];
   const colWidths = headers.map((h, i) =>
     Math.max(h.length, ...rows.map((r) => (r[i] ?? "").length)),
   );
@@ -528,7 +838,8 @@ export function formatGoDiffTable(
 
   const title = `=== OpenCode Go & OpenRouter Pricing (${cached.date}) ===\n`;
   const summaryLine = diff.summary ? `Summary: ${diff.summary}\n\n` : "\n";
-  return title + summaryLine + [headerLine, sep, ...rowLines].join("\n");
+  const footer = `\nMatched ${matchedCount}/${totalGoModels} Go models to OpenRouter market pricing.\n`;
+  return title + summaryLine + [headerLine, sep, ...rowLines].join("\n") + footer;
 }
 
 /**
@@ -764,18 +1075,19 @@ export default function (pi: ExtensionAPI) {
         fetchOpenRouterPricing(),
       ]);
 
-      const models = parseLimits(html);
-      if (Object.keys(models).length > 0) {
-        goPrices = models;
+      const { flatLimits, fullModels } = parseGoPricing(html);
+      if (Object.keys(fullModels).length > 0) {
+        goPrices = flatLimits;
         goStale = false;
         goFetchFailed = false;
 
         const prevCache = loadPreviousCache(dayStamp());
         const todayData: CachedPrices = {
+          schemaVersion: 2,
           date: dayStamp(),
           source: GO_DOCS_URL,
-          models,
-          opencode: { models },
+          models: flatLimits,
+          opencode: { models: fullModels },
           openrouter: { models: orPricing },
         };
 
