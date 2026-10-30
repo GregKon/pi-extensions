@@ -18,7 +18,8 @@
 // The TUI dialog itself still needs a human click-through; see improvement.md.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -616,4 +617,219 @@ test("registers /go-diff slash command", async () => {
     console.log = origLog;
   }
   assert.ok(logs.length > 0, "handler must print table or message to console");
+});
+
+test("loadCache fallback loads past-dated file with flat numeric opencode.models without models key", () => {
+  const origTmpdir = process.env.TMPDIR;
+  const origTmp = process.env.TMP;
+  const origTemp = process.env.TEMP;
+
+  const sandbox = mkdtempSync(join(tmpdir(), "zones-fallback-test-"));
+  try {
+    process.env.TMPDIR = sandbox;
+    process.env.TMP = sandbox;
+    process.env.TEMP = sandbox;
+
+    // Past-dated file (no today-file) without "models" key, only flat numeric opencode.models
+    const pastFile = join(sandbox, "opencode-go-prices-2025-01-01.json");
+    writeFileSync(
+      pastFile,
+      JSON.stringify({
+        date: "2025-01-01",
+        opencode: {
+          models: {
+            "glm-5.3-flash": 60,
+            "deepseek-chat": 15,
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    let table;
+    assert.doesNotThrow(() => {
+      table = mod.formatGoDiffTable();
+    });
+    assert.ok(table, "formatGoDiffTable must return a table string");
+    assert.match(table, /Matched \d+\/\d+ Go models/);
+  } finally {
+    if (origTmpdir !== undefined) process.env.TMPDIR = origTmpdir; else delete process.env.TMPDIR;
+    if (origTmp !== undefined) process.env.TMP = origTmp; else delete process.env.TMP;
+    if (origTemp !== undefined) process.env.TEMP = origTemp; else delete process.env.TEMP;
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("formatGoDiffTable single-token status overflow and two-token boundary", () => {
+  // 1. Single-token overflow: synthetic long price token emitted whole, no mid-number cut
+  const prevSingle = {
+    schemaVersion: 2,
+    date: "2026-10-20",
+    opencode: {
+      models: {
+        "model-synthetic": {
+          limit: 60,
+          price: { input: 0.1, output: 0.2, cachedRead: 0.01, cachedWrite: 0.02 },
+        },
+      },
+    },
+  };
+  const currSingle = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "model-synthetic": {
+          limit: 60,
+          price: { input: 0.1, output: 0.2, cachedRead: 1234567890123.12, cachedWrite: 0.02 },
+        },
+      },
+    },
+  };
+  const tableSingle = mod.formatGoDiffTable(currSingle, prevSingle);
+  // Single token > 20 chars emitted whole without mid-number cut
+  assert.match(tableSingle, /cr 0\.01>1234567890123\.12/);
+  assert.doesNotMatch(tableSingle, /cr 0\.01>1234567890123\.12…/);
+
+  // 2. Reachable two-token boundary: pair.length <= 29 vs pair.length > 29
+  // 2a. pair.length <= 29 -> both tokens joined with "; "
+  const prevTwoShort = {
+    schemaVersion: 2,
+    date: "2026-10-20",
+    opencode: {
+      models: {
+        "model-pair": {
+          limit: 60,
+          price: { input: 0.1, output: 0.2 },
+        },
+      },
+    },
+  };
+  const currTwoShort = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "model-pair": {
+          limit: 60,
+          price: { input: 0.3, output: 0.4 },
+        },
+      },
+    },
+  };
+  const tableTwoShort = mod.formatGoDiffTable(currTwoShort, prevTwoShort);
+  // "in 0.10>0.30; out 0.20>0.40" is 25 chars <= 29
+  assert.match(tableTwoShort, /in 0\.10>0\.30; out 0\.20>0\.40/);
+
+  // 2b. pair.length > 29 -> first token plus "…"
+  const prevTwoLong = {
+    schemaVersion: 2,
+    date: "2026-10-20",
+    opencode: {
+      models: {
+        "model-pair-long": {
+          limit: 60,
+          price: { input: 0.001, output: 0.003 },
+        },
+      },
+    },
+  };
+  const currTwoLong = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "model-pair-long": {
+          limit: 60,
+          price: { input: 0.002, output: 0.004 },
+        },
+      },
+    },
+  };
+  const tableTwoLong = mod.formatGoDiffTable(currTwoLong, prevTwoLong);
+  // "in 0.001>0.002; out 0.003>0.004" is 31 chars > 29, so first token + "…"
+  assert.match(tableTwoLong, /in 0\.001>0\.002…/);
+  assert.doesNotMatch(tableTwoLong, /in 0\.001>0\.002; out/);
+});
+
+test("formatGoDiffTable decodes HTML entities in model names and preserves paren qualifiers", () => {
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "MiniMax-Text-01 (&gt; 512K tokens)": { limit: 60 },
+        "A &amp; B": { limit: 15 },
+      },
+    },
+  };
+  const table = mod.formatGoDiffTable(current, current);
+
+  // Long name with &gt;: decoded to ">", parenthetical qualifier preserved, budget 24 chars
+  assert.match(table, /MiniMax-…\(> 512K tokens\)/);
+  assert.doesNotMatch(table, /&gt;/);
+
+  // Short name with &amp;: decoded to "A & B" before early return
+  assert.match(table, /A & B/);
+  assert.doesNotMatch(table, /&amp;/);
+});
+
+test("formatGoDiffTable width with all 5 counters > 0 ensures every line is <= 118 chars", () => {
+  const previous = {
+    schemaVersion: 2,
+    date: "2026-10-20",
+    opencode: {
+      models: {
+        "model-removed": { limit: 60 },
+        "model-limit-changed": { limit: 15 },
+        "model-price-changed": {
+          limit: 60,
+          price: { input: 0.1, output: 0.2 },
+        },
+        "model-or-changed": { limit: 60 },
+      },
+    },
+    openrouter: {
+      models: {
+        "provider/model-or-changed": { input: 0.01, output: 0.05 },
+      },
+    },
+  };
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "model-added": { limit: 60 },
+        "model-limit-changed": { limit: 60 },
+        "model-price-changed": {
+          limit: 60,
+          price: { input: 0.15, output: 0.25 },
+        },
+        "model-or-changed": { limit: 60 },
+      },
+    },
+    openrouter: {
+      models: {
+        "provider/model-or-changed": { input: 0.02, output: 0.06 },
+      },
+    },
+  };
+
+  const table = mod.formatGoDiffTable(current, previous);
+  const lines = table.split("\n");
+
+  let summaryLineFound = false;
+  for (const line of lines) {
+    assert.ok(
+      line.length <= 118,
+      `Line length ${line.length} exceeds 118 characters:\n${line}`,
+    );
+    if (line.startsWith("Summary:")) {
+      summaryLineFound = true;
+      assert.match(line, /Run \/go-diff to view\./, "Summary line must preserve trailing hint");
+      assert.match(line, /…/, "Summary line must contain ellipsis indicating truncation");
+    }
+  }
+  assert.ok(summaryLineFound, "Summary line must be present in output");
 });

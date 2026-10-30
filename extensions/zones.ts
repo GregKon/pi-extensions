@@ -665,19 +665,56 @@ export function computePriceDiff(
 }
 
 function truncateModelName(name: string, maxLen = 24): string {
-  if (name.length <= maxLen) return name;
-  const match = name.match(/^(.*?)(\s*\([^)]+\))$/);
+  const decoded = name
+    .replace(/&gt;/g, ">")
+    .replace(/&lt;/g, "<")
+    .replace(/&amp;/g, "&");
+  if (decoded.length <= maxLen) return decoded;
+  const match = decoded.match(/^(.*?)(\s*\([^)]+\))$/);
   if (match) {
     const base = match[1].trim();
     const paren = match[2].trim();
     if (paren.length + 4 > maxLen) {
-      return name.slice(0, maxLen - 1) + "…";
+      return decoded.slice(0, maxLen - 1) + "…";
     }
     const availBase = maxLen - paren.length - 1;
     const truncatedBase = base.slice(0, availBase).trimEnd();
     return `${truncatedBase}…${paren}`;
   }
-  return name.slice(0, maxLen - 1) + "…";
+  return decoded.slice(0, maxLen - 1) + "…";
+}
+
+function truncateSummary(summary: string, maxLen = 118): string {
+  const prefix = "Summary: ";
+  if (prefix.length + summary.length <= maxLen) return summary;
+
+  const hint = " Run /go-diff to view.";
+  const hintIdx = summary.lastIndexOf(hint);
+  const hasHint = hintIdx !== -1 && hintIdx + hint.length === summary.length;
+  const hintText = hasHint ? hint : "";
+  let body = hasHint ? summary.slice(0, hintIdx) : summary;
+  if (hasHint && body.endsWith(".")) {
+    body = body.slice(0, -1);
+  }
+
+  const segments = body.split(", ");
+  for (let k = segments.length - 1; k >= 1; k--) {
+    const candidate = `${segments.slice(0, k).join(", ")}…${hintText}`;
+    if (prefix.length + candidate.length <= maxLen) {
+      return candidate;
+    }
+  }
+
+  const avail = maxLen - prefix.length - hintText.length - 1;
+  if (avail > 0) {
+    const sliced = body.slice(0, avail);
+    const atBoundary = sliced.replace(/\s+\S*$/, "").trimEnd();
+    if (atBoundary.length > 0) {
+      return `${atBoundary}…${hintText}`;
+    }
+    return `${sliced}…${hintText}`;
+  }
+  return summary.slice(0, maxLen - prefix.length - 1) + "…";
 }
 
 function formatSingleTokenPrice(val: number | undefined): string {
@@ -839,7 +876,8 @@ export function formatGoDiffTable(
   );
 
   const title = `=== OpenCode Go & OpenRouter Pricing (${cached.date}) ===\n`;
-  const summaryLine = diff.summary ? `Summary: ${diff.summary}\n\n` : "\n";
+  const formattedSummary = diff.summary ? truncateSummary(diff.summary) : "";
+  const summaryLine = formattedSummary ? `Summary: ${formattedSummary}\n\n` : "\n";
   const footer = `\nMatched ${matchedCount}/${totalGoModels} Go models to OpenRouter market pricing.\n`;
   return title + summaryLine + [headerLine, sep, ...rowLines].join("\n") + footer;
 }

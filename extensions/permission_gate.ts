@@ -45,10 +45,10 @@ const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 // The "Shell and permissions" advisory used to be appended here via
 // `opts.appendSystemPrompt` in `before_agent_start`. pi does consume that mutation
 // (verified on 1.1.0: in a minimal setup the block reaches the rendered prompt), but in
-// the pilight profile family pi-caveman/pi-plan handlers return a `systemPrompt`, which
+// the `pi` profile pi-caveman/pi-plan-mode handlers return a `systemPrompt`, which
 // sets `forceSystemPrompt` — and then rendering ignores `appendSystemPrompt`, so the
 // block never reached the model there. The advisory now lives in the config repo as
-// `<AGENT_DIR>/rules/shell-permissions.md`, delivered by the `pilight` profile family
+// `<AGENT_DIR>/rules/shell-permissions.md`, delivered by the `pi` profile
 // through the official `--append-system-prompt` flag (loader-level append renders even
 // with `forceSystemPrompt`).
 
