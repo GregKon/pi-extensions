@@ -182,9 +182,10 @@ function computeZone(
 // Source of truth: https://opencode.ai/v2/docs/console/go ("Usage limits" table).
 // The old path /docs/go/ answers 404 (verified 2026-10-13) and /docs/go.md too, so
 // the v2 console page is the live one. That page renders TWO tab panels with a full
-// table each ("Go" and "Go Plus"); parseLimits picks the first table whose header
-// starts with "Model", i.e. the Go panel, so the Plus limits ($180/$240...) are
-// deliberately ignored. A parser that scanned every row would end up with Plus values.
+// table each ("Go" and "Go Plus"); the parser picks the FIRST table whose headers
+// contain BOTH "model" and "limit", i.e. the Go panel, so the Plus limits
+// ($180/$240...) are deliberately ignored. A parser that scanned every row
+// would end up with Plus values.
 // Limits change day-to-day, so we fetch the docs page at most once per day and
 // cache the parsed table in os.tmpdir(). If today's fetch fails, we fall back to the
 // newest older cache and mark the number with `*`; with no cache at all the segment
@@ -377,6 +378,7 @@ function parseLimitValue(cell: string): GoLimit | undefined {
   const normalUsd = cell.match(/\$([\d.]+)/);
   if (normalUsd) return parseFloat(normalUsd[1]);
   if (/unlimited/i.test(cell)) return "unlimited";
+  if (/free/i.test(cell)) return 0;
   return undefined;
 }
 
@@ -800,7 +802,7 @@ export function formatGoDiffTable(
       if (tokens.length === 0) {
         status = "ok";
       } else if (tokens.length === 1) {
-        status = tokens[0].length <= 29 ? tokens[0] : `${tokens[0].slice(0, 28)}…`;
+        status = tokens[0];
       } else if (tokens.length === 2) {
         const pair = tokens.join("; ");
         status = pair.length <= 29 ? pair : `${tokens[0]}…`;
@@ -813,7 +815,7 @@ export function formatGoDiffTable(
   }
 
   for (const rem of diff.opencode.removed) {
-    const remEntry = toGoEntry(rem.entry ?? (rem as unknown as { limit?: GoLimit }).limit);
+    const remEntry = toGoEntry(rem.entry);
     const limitStr = remEntry.limit === "unlimited" ? "unlimited" : `$${remEntry.limit}`;
     const inOutStr = remEntry.price
       ? `${formatSingleTokenPrice(remEntry.price.input)}/${formatSingleTokenPrice(remEntry.price.output)}`
