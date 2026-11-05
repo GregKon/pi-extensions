@@ -651,7 +651,7 @@ test("loadCache fallback loads past-dated file with flat numeric opencode.models
       table = mod.formatGoDiffTable();
     });
     assert.ok(table, "formatGoDiffTable must return a table string");
-    assert.match(table, /Matched \d+\/\d+ Go models/);
+    assert.match(table, /Matched \d+\/2 Go models/);
   } finally {
     if (origTmpdir !== undefined) process.env.TMPDIR = origTmpdir; else delete process.env.TMPDIR;
     if (origTmp !== undefined) process.env.TMP = origTmp; else delete process.env.TMP;
@@ -687,7 +687,7 @@ test("formatGoDiffTable single-token status overflow and two-token boundary", ()
     },
   };
   const tableSingle = mod.formatGoDiffTable(currSingle, prevSingle);
-  // Single token > 20 chars emitted whole without mid-number cut
+  // Single token of 24 chars emitted whole without mid-number cut
   assert.match(tableSingle, /cr 0\.01>1234567890123\.12/);
   assert.doesNotMatch(tableSingle, /cr 0\.01>1234567890123\.12…/);
 
@@ -718,7 +718,7 @@ test("formatGoDiffTable single-token status overflow and two-token boundary", ()
     },
   };
   const tableTwoShort = mod.formatGoDiffTable(currTwoShort, prevTwoShort);
-  // "in 0.10>0.30; out 0.20>0.40" is 25 chars <= 29
+  // "in 0.10>0.30; out 0.20>0.40" is 27 chars <= 29
   assert.match(tableTwoShort, /in 0\.10>0\.30; out 0\.20>0\.40/);
 
   // 2b. pair.length > 29 -> first token plus "…"
@@ -774,6 +774,23 @@ test("formatGoDiffTable decodes HTML entities in model names and preserves paren
   assert.doesNotMatch(table, /&amp;/);
 });
 
+test("formatGoDiffTable decodes HTML entities in a single pass without re-evaluating entities", () => {
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "X &amp;gt; Y": { limit: 60 },
+      },
+    },
+  };
+  const table = mod.formatGoDiffTable(current, current);
+
+  // Single-pass decode order (&gt;/&lt; before &amp;) ensures &amp;gt; yields literal "X &gt; Y", not "X > Y"
+  assert.match(table, /X &gt; Y/);
+  assert.doesNotMatch(table, /X > Y/);
+});
+
 test("formatGoDiffTable width with all 5 counters > 0 ensures every line is <= 118 chars", () => {
   const previous = {
     schemaVersion: 2,
@@ -827,6 +844,7 @@ test("formatGoDiffTable width with all 5 counters > 0 ensures every line is <= 1
     );
     if (line.startsWith("Summary:")) {
       summaryLineFound = true;
+      assert.match(line, /\+1 Go model added/, "truncated summary must keep the first segment");
       assert.match(line, /Run \/go-diff to view\./, "Summary line must preserve trailing hint");
       assert.match(line, /…/, "Summary line must contain ellipsis indicating truncation");
     }

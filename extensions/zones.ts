@@ -705,16 +705,14 @@ function truncateSummary(summary: string, maxLen = 118): string {
     }
   }
 
-  const avail = maxLen - prefix.length - hintText.length - 1;
-  if (avail > 0) {
-    const sliced = body.slice(0, avail);
-    const atBoundary = sliced.replace(/\s+\S*$/, "").trimEnd();
-    if (atBoundary.length > 0) {
-      return `${atBoundary}…${hintText}`;
-    }
-    return `${sliced}…${hintText}`;
+  // maxLen is the whole-line budget INCLUDING the "Summary: " prefix.
+  const avail = Math.max(0, maxLen - prefix.length - hintText.length - 1);
+  const sliced = body.slice(0, avail);
+  const atBoundary = sliced.replace(/\s+\S*$/, "").trimEnd();
+  if (atBoundary.length > 0) {
+    return `${atBoundary}…${hintText}`;
   }
-  return summary.slice(0, maxLen - prefix.length - 1) + "…";
+  return `${sliced}…${hintText}`;
 }
 
 function formatSingleTokenPrice(val: number | undefined): string {
