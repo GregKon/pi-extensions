@@ -664,7 +664,13 @@ export function computePriceDiff(
   return diff;
 }
 
-function truncateModelName(name: string, maxLen = 24): string {
+/**
+ * Truncate a model name to fit the /go-diff table. Default cap is 36 chars.
+ * If the name ends in a parenthetical qualifier, preserve the qualifier:
+ * "VeryLongModelNameThatIsOverThirtySixCharacters (Off-Peak)" ->
+ * "VeryLongModelNameThatIsOv…(Off-Peak)".
+ */
+function truncateModelName(name: string, maxLen = 36): string {
   const decoded = name
     .replace(/&gt;/g, ">")
     .replace(/&lt;/g, "<")
@@ -715,13 +721,14 @@ function truncateSummary(summary: string, maxLen = 118): string {
   return `${sliced}…${hintText}`;
 }
 
-function formatSingleTokenPrice(val: number | undefined): string {
+function fmtPrice(val: number | undefined): string {
   if (val === undefined) return "—";
   if (val === 0) return "Free";
-  if (val >= 10) {
-    return `$${val.toFixed(2)}`;
-  }
-  return `$${val.toFixed(3)}`;
+  // 3 decimals keep nearby prices distinct (e.g. .125 vs .132); differences
+  // below 0.001 collapse to <.001 (non-zero) or Free (exact zero).
+  let s = val.toFixed(3).replace(/\.?0+$/, "");
+  if (s === "0") return "<.001";
+  return s.replace(/^0\./, ".");
 }
 
 function formatTokenNum(v: number | undefined): string {
@@ -732,11 +739,11 @@ function formatTokenNum(v: number | undefined): string {
 }
 
 function fmtLimit(l: GoLimit): string {
-  return l === "unlimited" ? "unl" : `$${l}`;
+  return l === "unlimited" ? "unlimited" : String(l);
 }
 
 /**
- * Format a Markdown / console table showing Model, Go Limit, Go In/Out, Go Cache, OR In/Out, and Status.
+ * Format a Markdown / console table showing Model, Limit, In/Out, Cache, OR In/Out, and Status.
  */
 export function formatGoDiffTable(
   todayCache?: CachedPrices,
@@ -771,26 +778,34 @@ export function formatGoDiffTable(
   const priceChangeMap = new Map(diff.opencode.priceChanged.map((m) => [m.model, m]));
   const orChangeMap = new Map(diff.openrouter.changed.map((m) => [m.model, m]));
 
-  const rows: string[][] = [];
+  const DESCRIPTION = "Prices: USD per 1M tokens · Limit: USD/month · sorted by limit desc, ties A–Z";
+
+  const rows: Array<{
+    cells: string[];
+    name: string;
+    limitRank: number;
+    removed: boolean;
+  }> = [];
   let matchedCount = 0;
   const totalGoModels = Object.keys(goModels).length;
 
   for (const [modelKey, rawEntry] of Object.entries(goModels)) {
     const entry = toGoEntry(rawEntry);
-    const limitStr = entry.limit === "unlimited" ? "unlimited" : `$${entry.limit}`;
+    const limitStr = entry.limit === "unlimited" ? "unlimited" : String(entry.limit);
+    const limitRank = entry.limit === "unlimited" ? Infinity : entry.limit;
     const norm = normId(modelKey);
     const orEntry = orByNorm.get(norm);
     if (orEntry) matchedCount++;
 
     const inOutStr = entry.price
-      ? `${formatSingleTokenPrice(entry.price.input)}/${formatSingleTokenPrice(entry.price.output)}`
+      ? `${fmtPrice(entry.price.input)}/${fmtPrice(entry.price.output)}`
       : "—/—";
 
     let cacheStr = "—/—";
     if (entry.price) {
       if (entry.price.cachedRead !== undefined || entry.price.cachedWrite !== undefined) {
-        const crStr = formatSingleTokenPrice(entry.price.cachedRead);
-        const cwStr = formatSingleTokenPrice(entry.price.cachedWrite);
+        const crStr = fmtPrice(entry.price.cachedRead);
+        const cwStr = fmtPrice(entry.price.cachedWrite);
         cacheStr = `${crStr}/${cwStr}`;
       } else {
         cacheStr = "—/—";
@@ -798,7 +813,7 @@ export function formatGoDiffTable(
     }
 
     const orPriceStr = orEntry
-      ? `${formatSingleTokenPrice(orEntry.price.input)}/${formatSingleTokenPrice(orEntry.price.output)}`
+      ? `${fmtPrice(orEntry.price.input)}/${fmtPrice(orEntry.price.output)}`
       : "—";
 
     let status = "ok";
@@ -846,30 +861,53 @@ export function formatGoDiffTable(
       }
     }
 
-    rows.push([truncateModelName(modelKey), limitStr, inOutStr, cacheStr, orPriceStr, status]);
+    rows.push({
+      cells: [truncateModelName(modelKey), limitStr, inOutStr, cacheStr, orPriceStr, status],
+      name: modelKey,
+      limitRank,
+      removed: false,
+    });
   }
 
   for (const rem of diff.opencode.removed) {
     const remEntry = toGoEntry(rem.entry);
-    const limitStr = remEntry.limit === "unlimited" ? "unlimited" : `$${remEntry.limit}`;
+    const limitStr = remEntry.limit === "unlimited" ? "unlimited" : String(remEntry.limit);
+    const limitRank = remEntry.limit === "unlimited" ? Infinity : remEntry.limit;
     const inOutStr = remEntry.price
-      ? `${formatSingleTokenPrice(remEntry.price.input)}/${formatSingleTokenPrice(remEntry.price.output)}`
+      ? `${fmtPrice(remEntry.price.input)}/${fmtPrice(remEntry.price.output)}`
       : "—/—";
     const cacheStr = remEntry.price
-      ? `${formatSingleTokenPrice(remEntry.price.cachedRead)}/${formatSingleTokenPrice(remEntry.price.cachedWrite)}`
+      ? `${fmtPrice(remEntry.price.cachedRead)}/${fmtPrice(remEntry.price.cachedWrite)}`
       : "—/—";
-    rows.push([truncateModelName(rem.model), limitStr, inOutStr, cacheStr, "—", "removed"]);
+    rows.push({
+      cells: [truncateModelName(rem.model), limitStr, inOutStr, cacheStr, "—", "removed"],
+      name: rem.model,
+      limitRank,
+      removed: true,
+    });
   }
 
-  rows.sort((a, b) => a[0].localeCompare(b[0]));
+  // Sort: removed rows last, and within each group by limit desc, then
+  // by raw model name. After a limit change the row moves, which is
+  // why the Status column still shows e.g. "limit 60>30".
+  rows.sort((a, b) => {
+    if (a.removed !== b.removed) return a.removed ? 1 : -1;
+    if (a.limitRank !== b.limitRank) return b.limitRank - a.limitRank;
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
 
-  const headers = ["Model", "Go Limit", "Go In/Out", "Go Cache", "OR In/Out", "Status"];
+  const headers = ["Model", "Limit", "In/Out", "Cache", "OR In/Out", "Status"];
+  const caps = [36, 9, 10, 9, 10, 29];
+  // 36+9+10+9+10+29 + 5*3 separators = 118, enforced by construction.
+  const cappedRows = rows.map(({ cells }) =>
+    cells.map((cell, i) => (cell.length > caps[i] ? cell.slice(0, caps[i] - 1) + "…" : cell)),
+  );
   const colWidths = headers.map((h, i) =>
-    Math.max(h.length, ...rows.map((r) => (r[i] ?? "").length)),
+    Math.max(h.length, ...cappedRows.map((r) => (r[i] ?? "").length)),
   );
   const sep = colWidths.map((w) => "-".repeat(w)).join("-+-");
   const headerLine = headers.map((h, i) => h.padEnd(colWidths[i])).join(" | ");
-  const rowLines = rows.map((r) =>
+  const rowLines = cappedRows.map((r) =>
     r.map((cell, i) => (cell ?? "").padEnd(colWidths[i])).join(" | "),
   );
 
@@ -877,7 +915,7 @@ export function formatGoDiffTable(
   const formattedSummary = diff.summary ? truncateSummary(diff.summary) : "";
   const summaryLine = formattedSummary ? `Summary: ${formattedSummary}\n\n` : "\n";
   const footer = `\nMatched ${matchedCount}/${totalGoModels} Go models to OpenRouter market pricing.\n`;
-  return title + summaryLine + [headerLine, sep, ...rowLines].join("\n") + footer;
+  return title + summaryLine + DESCRIPTION + "\n" + [headerLine, sep, ...rowLines].join("\n") + footer;
 }
 
 /**

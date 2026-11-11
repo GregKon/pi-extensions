@@ -387,16 +387,14 @@ test("formatGoDiffTable formats a table with required columns", () => {
   };
   const table = mod.formatGoDiffTable(current, previous);
   assert.match(table, /Model/);
-  assert.match(table, /Go Limit/);
-  assert.match(table, /Go In\/Out/);
-  assert.match(table, /Go Cache/);
+  assert.match(table, /\|\s*Limit\s*\|\s*In\/Out\s*\|\s*Cache\s*\|/);
   assert.match(table, /OR In\/Out/);
   assert.match(table, /Status/);
   assert.match(table, /glm5\.3flash/);
-  assert.match(table, /\$60/);
+  assert.match(table, /\|\s*60\s*\|/);
   assert.match(table, /—\/—/);
-  assert.match(table, /\$0\.041\/\$0\.120/);
-  assert.match(table, /limit \$15>\$60/);
+  assert.match(table, /\|\s*\.041\/\.12\s*\|/);
+  assert.match(table, /limit 15>60/);
 });
 
 test("parseGoPricing parses only first panel (Go) and ignores Go Plus", () => {
@@ -511,7 +509,7 @@ test("formatGoDiffTable handles v1 cache data gracefully without TypeError", () 
   };
   const table = mod.formatGoDiffTable(currV1, prevV1);
   assert.match(table, /glm5\.3flash/);
-  assert.match(table, /\$60/);
+  assert.match(table, /\|\s*60\s*\|/);
   assert.match(table, /—\/—/);
   assert.match(table, /ok/);
 });
@@ -572,6 +570,10 @@ test("formatGoDiffTable worst-case row width does not exceed 118 characters", ()
           limit: 60,
           price: { input: 0.2, output: 0.6, cachedRead: 0.04, cachedWrite: 2.8 },
         },
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789": {
+          limit: 100,
+          price: { input: 0.15, output: 0.6, cachedRead: 0.003, cachedWrite: 0 },
+        },
       },
     },
     openrouter: {
@@ -583,14 +585,12 @@ test("formatGoDiffTable worst-case row width does not exceed 118 characters", ()
   const table = mod.formatGoDiffTable(current, previous);
   const lines = table.split("\n");
   for (const line of lines) {
-    if (line.includes("|") || line.includes("-+-")) {
-      assert.ok(
-        line.length <= 118,
-        `Table row length ${line.length} exceeds 118 characters:\n${line}`,
-      );
-    }
+    assert.ok(
+      line.length <= 118,
+      `Line length ${line.length} exceeds 118 characters:\n${line}`,
+    );
   }
-  assert.match(table, /Matched 1\/1 Go models to OpenRouter market pricing\./);
+  assert.match(table, /Matched 1\/2 Go models to OpenRouter market pricing\./);
 });
 
 test("registers /go-diff slash command", async () => {
@@ -760,18 +760,23 @@ test("formatGoDiffTable decodes HTML entities in model names and preserves paren
       models: {
         "MiniMax-Text-01 (&gt; 512K tokens)": { limit: 60 },
         "A &amp; B": { limit: 15 },
+        "SuperLongModelNameThatIsOverThirtySixCharacters (Off-Peak)": { limit: 60 },
       },
     },
   };
   const table = mod.formatGoDiffTable(current, current);
 
-  // Long name with &gt;: decoded to ">", parenthetical qualifier preserved, budget 24 chars
-  assert.match(table, /MiniMax-…\(> 512K tokens\)/);
+  // Name ≤ 36 chars is rendered in full.
+  assert.match(table, /MiniMax-Text-01 \(> 512K tokens\)/);
+  assert.doesNotMatch(table, /MiniMax-…\(> 512K tokens\)/);
   assert.doesNotMatch(table, /&gt;/);
 
   // Short name with &amp;: decoded to "A & B" before early return
   assert.match(table, /A & B/);
   assert.doesNotMatch(table, /&amp;/);
+
+  // Name > 36 chars with trailing qualifier keeps base…(qualifier).
+  assert.match(table, /SuperLongModelNameThatIsO…\(Off-Peak\)/);
 });
 
 test("formatGoDiffTable decodes HTML entities in a single pass without re-evaluating entities", () => {
@@ -850,4 +855,73 @@ test("formatGoDiffTable width with all 5 counters > 0 ensures every line is <= 1
     }
   }
   assert.ok(summaryLineFound, "Summary line must be present in output");
+});
+
+test("formatGoDiffTable sorts by limit desc, unlimited first, ties A–Z, removed last", () => {
+  const previous = {
+    schemaVersion: 2,
+    date: "2026-10-20",
+    opencode: {
+      models: {
+        "Zulu-15": { limit: 15 },
+        "Alpha-100": { limit: 100 },
+        "Beam-Free": { limit: "unlimited" },
+        "Gamma-60": { limit: 60 },
+        "Removed-30": { limit: 30 },
+      },
+    },
+    openrouter: { models: {} },
+  };
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "Zulu-15": { limit: 15 },
+        "Alpha-100": { limit: 100 },
+        "Beam-Free": { limit: "unlimited" },
+        "Gamma-60": { limit: 60 },
+      },
+    },
+    openrouter: { models: {} },
+  };
+  const table = mod.formatGoDiffTable(current, previous);
+  const modelLines = table.split("\n").filter((line) => line.includes("|") && !line.includes("Model"));
+  const names = modelLines.map((line) => line.split("|")[0].trim());
+  assert.deepEqual(names, [
+    "Beam-Free",
+    "Alpha-100",
+    "Gamma-60",
+    "Zulu-15",
+    "Removed-30",
+  ]);
+});
+
+test("formatGoDiffTable fmtPrice collapses leading zero and keeps 3-decimal distinctions", () => {
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "price-sweep": {
+          limit: 60,
+          price: { input: 0.006, output: 0.008, cachedRead: 0.125, cachedWrite: 0.132 },
+        },
+        "int-price": {
+          limit: 60,
+          price: { input: 100, output: 10, cachedRead: 0.19, cachedWrite: 4 },
+        },
+        "free-stuff": { limit: 60, price: { input: 0, output: 0 } },
+        "no-price": { limit: 60 },
+      },
+    },
+    openrouter: { models: {} },
+  };
+  const table = mod.formatGoDiffTable(current, current);
+  assert.match(table, /\.006\/\.008/);
+  assert.match(table, /\.125\/\.132/);
+  assert.match(table, /\|\s*100\/10\s*\|/);
+  assert.match(table, /\|\s*\.19\/4\s*\|/);
+  assert.match(table, /Free\/Free/);
+  assert.match(table, /—\/—/);
 });
