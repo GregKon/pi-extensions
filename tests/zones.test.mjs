@@ -925,3 +925,84 @@ test("formatGoDiffTable fmtPrice collapses leading zero and keeps 3-decimal dist
   assert.match(table, /Free\/Free/);
   assert.match(table, /—\/—/);
 });
+
+test("formatGoDiffTable fmtPrice renders sub-cent prices as <.001 and exact zero as Free", () => {
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "sub-cent-one": { limit: 60, price: { input: 0.0003, output: 0.5 } },
+        "sub-cent-both": { limit: 60, price: { input: 0.0004, output: 0.0002 } },
+        "zero-price": { limit: 60, price: { input: 0, output: 0 } },
+      },
+    },
+    openrouter: { models: {} },
+  };
+  const table = mod.formatGoDiffTable(current, current);
+  // A single sub-cent side must not collapse to Free.
+  assert.match(table, /<\.001\/.5/, "single sub-cent input must render <.001, not Free");
+  // Both sides sub-cent overflow the 10-char In/Out cap and end-truncate.
+  // Real Go/OpenRouter prices never reach this range, so the truncation is accepted.
+  assert.match(table, /<\.001\/<\.0…/, "both-sides sub-cent pair truncates to <.001/<.0…");
+  assert.match(table, /Free\/Free/, "exactly zero still renders Free");
+});
+
+test("formatGoDiffTable tie-breaks equal limits alphabetically A→Z", () => {
+  const previous = {
+    schemaVersion: 2,
+    date: "2026-10-20",
+    opencode: {
+      models: {
+        "Beam-Unlimited": { limit: "unlimited" },
+        "Alpha-60": { limit: 60 },
+        "Zulu-60": { limit: 60 },
+        "Delta-30": { limit: 30 },
+        "Removed-60": { limit: 60 },
+      },
+    },
+    openrouter: { models: {} },
+  };
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "Beam-Unlimited": { limit: "unlimited" },
+        "Alpha-60": { limit: 60 },
+        "Zulu-60": { limit: 60 },
+        "Delta-30": { limit: 30 },
+      },
+    },
+    openrouter: { models: {} },
+  };
+  const table = mod.formatGoDiffTable(current, previous);
+  const modelLines = table.split("\n").filter((line) => line.includes("|") && !line.includes("Model"));
+  const names = modelLines.map((line) => line.split("|")[0].trim());
+  assert.deepEqual(names, [
+    "Beam-Unlimited",
+    "Alpha-60",
+    "Zulu-60",
+    "Delta-30",
+    "Removed-60",
+  ]);
+});
+
+test("formatGoDiffTable includes the description line within the 118-char budget", () => {
+  const current = {
+    schemaVersion: 2,
+    date: "2026-10-21",
+    opencode: {
+      models: {
+        "glm5.3flash": { limit: 60, price: { input: 0.15, output: 0.5 } },
+      },
+    },
+    openrouter: { models: {} },
+  };
+  const table = mod.formatGoDiffTable(current, current);
+  const DESCRIPTION = "Prices: USD per 1M tokens · Limit: USD/month · sorted by limit desc, ties A–Z";
+  assert.ok(table.includes(DESCRIPTION), "table must contain the exact description line");
+  const line = table.split("\n").find((l) => l.includes(DESCRIPTION));
+  assert.ok(line, "description line must be present as a standalone line");
+  assert.ok(line.length <= 118, `description line length ${line.length} exceeds 118 characters`);
+});
