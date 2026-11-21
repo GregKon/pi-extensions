@@ -48,6 +48,13 @@
  * sorts after "caveman"/"deepseek-peak", so the colored zone lands at the RIGHT end of
  * that status line. No extra line, no footer replacement, colors via ANSI (theme.fg).
  *
+ * Right of the zone, for `opencode-go` models only: the model's monthly limit from the
+ * Go docs (`| $60`), then the live subscription allowance from
+ * `GET https://opencode.ai/zen/go/v1/usage` (`· 5h: 2% · W: 23% · M: 49%`). The allowance
+ * is refetched on session start and model change, after a turn with a 3-minute cooldown,
+ * and hourly while the model stays selected; a failed read keeps the last values and marks
+ * them with `*`, and disappears entirely on any non-go model.
+ *
  * Prompt gate — only at session start (also on /resume) and when the model changes:
  *   green  -> nothing
  *   yellow -> ask once: user must type "yes" before the prompt is sent
@@ -936,6 +943,57 @@ function fetchOpenRouterPricing(): Promise<Record<string, OpenRouterPrice>> {
 const ORANGE = "\x1b[38;5;208m";
 const RESET_FG = "\x1b[39m";
 
+const GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
+const GO_USAGE_COOLDOWN_MS = 3 * 60 * 1000;
+const GO_USAGE_INTERVAL_MS = 60 * 60 * 1000;
+
+interface GoUsageWindows {
+  rolling?: { percent?: number };
+  weekly?: { percent?: number };
+  monthly?: { percent?: number };
+}
+
+/** Formats percentage with colors: <50% white, 50-79% yellow, 80-89% orange, >=90% red */
+function formatUsagePercent(
+  pct: number,
+  bold: (s: string) => string,
+  fg: (c: "success" | "warning" | "error", s: string) => string,
+): string {
+  const rounded = Math.round(pct);
+  const text = `${rounded}%`;
+  if (rounded >= 90) {
+    return bold(fg("error", text));
+  }
+  if (rounded >= 80) {
+    return bold(`${ORANGE}${text}${RESET_FG}`);
+  }
+  if (rounded >= 50) {
+    return bold(fg("warning", text));
+  }
+  return bold(`\x1b[97m${text}\x1b[39m`);
+}
+
+function formatGoUsage(
+  usage: GoUsageWindows,
+  bold: (s: string) => string,
+  fg: (c: "success" | "warning" | "error", s: string) => string,
+  stale = false,
+): string {
+  const parts: string[] = [];
+  if (usage.rolling && typeof usage.rolling.percent === "number") {
+    parts.push(`5h: ${formatUsagePercent(usage.rolling.percent, bold, fg)}`);
+  }
+  if (usage.weekly && typeof usage.weekly.percent === "number") {
+    parts.push(`W: ${formatUsagePercent(usage.weekly.percent, bold, fg)}`);
+  }
+  if (usage.monthly && typeof usage.monthly.percent === "number") {
+    parts.push(`M: ${formatUsagePercent(usage.monthly.percent, bold, fg)}`);
+  }
+  if (parts.length === 0) return "";
+  const mark = stale ? "*" : "";
+  return bold(` · ${parts.join(" · ")}${mark}`);
+}
+
 /** Limit display: "$60" / "unlimited", colored green/yellow/red/orange. */
 function limitLabel(
   limit: GoLimit,
@@ -1012,6 +1070,88 @@ export default function (pi: ExtensionAPI) {
   let goFetchFailed = false; // today's fetch failed (offline / 404 / layout change)
   let goFetching = false;
   let lastCtx: (CtxLike & { thinkingLevel?: string; ui?: any }) | undefined;
+
+  // opencode-go live quota usage state
+  let goUsageData: GoUsageWindows | null = null;
+  // Last ATTEMPT, not last success: a broken key or a 5xx must not turn every turn into a request.
+  let lastGoUsageAttempt = 0;
+  let goUsageFetching = false;
+  let goUsageFailed = false;
+  // Set from `updateStatus` (always a fresh ctx). The timer must NOT read a captured ctx's getters:
+  // `ctx.model`/`ctx.ui` call `assertActive()` and throw once the session was replaced or reloaded.
+  let goModelActive = false;
+
+  type UsageCtx = {
+    mode?: string;
+    modelRegistry?: { getProviderAuth?: (id: string) => { apiKey?: string } | undefined };
+  };
+
+  /**
+   * Key for the usage endpoint. pi's registry already resolves both sources it can come from
+   * (auth.json and the provider's env var), and the env check covers the rest without touching
+   * the agent directory by hand — extensions here must not build it from the home directory.
+   */
+  function resolveGoApiKey(ctx?: UsageCtx): string | undefined {
+    try {
+      const authKey = ctx?.modelRegistry?.getProviderAuth?.("opencode-go")?.apiKey;
+      if (typeof authKey === "string" && authKey.trim()) return authKey.trim();
+    } catch {
+      // best-effort
+    }
+    const envKey = process.env.OPENCODE_API_KEY || process.env.OPENCODE_GO_API_KEY;
+    if (envKey && envKey.trim()) return envKey.trim();
+    return undefined;
+  }
+
+  async function fetchGoUsage(ctx?: UsageCtx): Promise<void> {
+    if (goUsageFetching) return;
+    // Same two gates as `fetchGoPrices`: a local-only session makes no request of its own, and the
+    // footer this feeds does not exist outside the TUI.
+    if (localOnly || process.env.PI_OFFLINE || ctx?.mode !== "tui") return;
+    const apiKey = resolveGoApiKey(ctx);
+    // No key is not a failure to report: a session that never authenticated to the provider has
+    // nothing to show, and a permanent red segment would be noise.
+    if (!apiKey) return;
+    goUsageFetching = true;
+    lastGoUsageAttempt = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+
+    try {
+      const res = await fetch(GO_USAGE_URL, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const json: any = await res.json();
+      if (json?.usage && typeof json.usage === "object") {
+        goUsageData = {
+          rolling: json.usage.rolling,
+          weekly: json.usage.weekly,
+          monthly: json.usage.monthly,
+        };
+        goUsageFailed = false;
+      } else {
+        goUsageFailed = true;
+      }
+    } catch {
+      goUsageFailed = true;
+    } finally {
+      clearTimeout(timer);
+      goUsageFetching = false;
+      // `lastCtx` may be stale by now (session replaced or reloaded): its getters throw. A failed
+      // repaint must never become an unhandled rejection in a promise nobody awaits.
+      if (lastCtx) {
+        try {
+          updateStatus(lastCtx);
+        } catch {
+          goModelActive = false;
+        }
+      }
+    }
+  }
 
   function isGoModel(provider: string | undefined): boolean {
     return (provider || "").toLowerCase().includes("opencode-go");
@@ -1280,6 +1420,14 @@ export default function (pi: ExtensionAPI) {
         fgLabel,
       );
     }
+    if (isGoModel(model.provider)) {
+      if (goUsageData) {
+        status += formatGoUsage(goUsageData, boldLabel, fgLabel, goUsageFailed);
+      } else if (goUsageFailed) {
+        status += boldLabel(fgLabel("error", " · Go: [err]"));
+      }
+    }
+    goModelActive = isGoModel(model.provider);
     ctx.ui.setStatus("zones", status);
   }
 
@@ -1352,6 +1500,9 @@ export default function (pi: ExtensionAPI) {
         fetchGoPrices();
       }
     }
+    if (ctx.model && isGoModel((ctx.model as ModelLike).provider)) {
+      fetchGoUsage(ctx);
+    }
     updateStatus(ctx);
   });
 
@@ -1370,6 +1521,9 @@ export default function (pi: ExtensionAPI) {
       // `.zonelocal`: a non-loopback model is refused. Interactive keeps the session (prompts
       // are refused by `input`, /model can still fix it); non-interactive stops the process.
       if (localOnly && !modelLocal(model)) enforceLocalOnly(model, ctx as CtxLike);
+      if (isGoModel(model.provider) && Date.now() - lastGoUsageAttempt >= GO_USAGE_COOLDOWN_MS) {
+        fetchGoUsage(ctx);
+      }
     }
     updateStatus(ctx);
   });
@@ -1404,7 +1558,33 @@ export default function (pi: ExtensionAPI) {
     return { block: true, reason: why };
   });
 
+  pi.on("agent_end", async (_event, ctx) => {
+    const model = (ctx as CtxLike).model;
+    if (model && isGoModel(model.provider)) {
+      if (Date.now() - lastGoUsageAttempt >= GO_USAGE_COOLDOWN_MS) {
+        fetchGoUsage(ctx);
+      }
+    }
+  });
+
+  // Hourly refresh while a go model stays selected. `unref()` keeps the extension from holding
+  // the process (and the headless tests) alive: the timer is a convenience, not a reason to run.
+  // The body never touches a ctx getter (see `goModelActive`) and swallows a throw from a stale
+  // ctx: an exception inside a timer callback would be an uncaughtException, not a lost repaint.
+  const goUsageTimer = setInterval(() => {
+    if (!goModelActive || !lastCtx) return;
+    try {
+      fetchGoUsage(lastCtx);
+    } catch {
+      goModelActive = false;
+    }
+  }, GO_USAGE_INTERVAL_MS);
+  (goUsageTimer as { unref?: () => void }).unref?.();
+
   pi.on("session_shutdown", async (_event, ctx) => {
+    clearInterval(goUsageTimer);
+    goModelActive = false;
+    lastCtx = undefined;
     gatePending = false;
     egressConfirmed = false;
     ctx.ui.setStatus("zones", undefined);
