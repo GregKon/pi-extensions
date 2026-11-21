@@ -991,7 +991,8 @@ function formatGoUsage(
   }
   if (parts.length === 0) return "";
   const mark = stale ? "*" : "";
-  return bold(` · ${parts.join(" · ")}${mark}`);
+  // "||" separates the docs limit from the live allowance; "·" stays inside the allowance.
+  return bold(` || ${parts.join(" · ")}${mark}`);
 }
 
 /** Limit display: "$60" / "unlimited", colored green/yellow/red/orange. */
