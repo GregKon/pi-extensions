@@ -948,9 +948,26 @@ const GO_USAGE_COOLDOWN_MS = 3 * 60 * 1000;
 const GO_USAGE_INTERVAL_MS = 60 * 60 * 1000;
 
 interface GoUsageWindows {
-  rolling?: { percent?: number };
-  weekly?: { percent?: number };
-  monthly?: { percent?: number };
+  rolling?: { percent?: number; resetsAt?: string };
+  weekly?: { percent?: number; resetsAt?: string };
+  monthly?: { percent?: number; resetsAt?: string };
+}
+
+/**
+ * Time left until a window resets, in the largest whole unit that still says something:
+ * `45m`, `4h`, `8d`. One unit only — this rides in the footer next to three percentages.
+ */
+function formatCountdown(resetsAt: string | undefined, now = Date.now()): string {
+  if (!resetsAt) return "";
+  const at = Date.parse(resetsAt);
+  if (!Number.isFinite(at)) return "";
+  const ms = at - now;
+  if (ms <= 0) return "now";
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(ms / 3_600_000);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
 }
 
 /** Formats percentage with colors: <50% white, 50-79% yellow, 80-89% orange, >=90% red */
@@ -979,16 +996,16 @@ function formatGoUsage(
   fg: (c: "success" | "warning" | "error", s: string) => string,
   stale = false,
 ): string {
+  const window = (label: string, w: { percent?: number; resetsAt?: string } | undefined) => {
+    if (!w || typeof w.percent !== "number") return;
+    const left = formatCountdown(w.resetsAt);
+    const suffix = left ? ` (${left})` : "";
+    parts.push(`${label}: ${formatUsagePercent(w.percent, bold, fg)}${suffix}`);
+  };
   const parts: string[] = [];
-  if (usage.rolling && typeof usage.rolling.percent === "number") {
-    parts.push(`5h: ${formatUsagePercent(usage.rolling.percent, bold, fg)}`);
-  }
-  if (usage.weekly && typeof usage.weekly.percent === "number") {
-    parts.push(`W: ${formatUsagePercent(usage.weekly.percent, bold, fg)}`);
-  }
-  if (usage.monthly && typeof usage.monthly.percent === "number") {
-    parts.push(`M: ${formatUsagePercent(usage.monthly.percent, bold, fg)}`);
-  }
+  window("5h", usage.rolling);
+  window("W", usage.weekly);
+  window("M", usage.monthly);
   if (parts.length === 0) return "";
   const mark = stale ? "*" : "";
   // "||" separates the docs limit from the live allowance; "·" stays inside the allowance.
