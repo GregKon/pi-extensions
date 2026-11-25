@@ -269,26 +269,72 @@ test("no hardcoded locale in the notification footer", () => {
 });
 
 // ----------------------------------------------------------- opencode-go and openrouter diff & pricing
-test("parseLimits extracts monthly limits correctly from HTML", () => {
-  const html = `
-    <table><thead><tr><th>Model</th><th>Input</th><th>Monthly limit</th></tr></thead>
-    <tbody>
-      <tr><td>GLM-5.3-Flash</td><td>$0.15</td><td><strong>$60</strong></td></tr>
-      <tr><td>Step 5 Preview</td><td>$1.00</td><td><del>$15</del> <strong>$60</strong><br/><small>promo</small></td></tr>
-      <tr><td>LongCat 2.5 Preview Free</td><td>Free</td><td><strong>Unlimited</strong><br/><small>limited time</small></td></tr>
-      <tr><td>Qwen3.8 Max</td><td>$2.00</td><td>$15</td></tr>
-    </tbody></table>
-  `;
-  const limits = mod.parseLimits(html);
-  assert.equal(limits["glm5.3flash"], 60);
-  assert.equal(limits["step5preview"], 60);
-  assert.equal(limits["longcat2.5preview"], "unlimited");
-  assert.equal(limits["qwen3.8max"], 15);
+test("resolveGoPlan defaults to go and rejects unknown plans", () => {
+  // The plan is passed explicitly: the ambient OPENCODE_GO_PLAN must not influence the result.
+  assert.equal(mod.resolveGoPlan(""), "go");
+  assert.equal(mod.resolveGoPlan("   "), "go");
+  assert.equal(mod.resolveGoPlan("enterprise"), "go");
+  assert.equal(mod.resolveGoPlan("GO"), "go");
+  assert.equal(mod.resolveGoPlan(" go-plus "), "go-plus", "trimmed and lowercased");
+  assert.equal(mod.resolveGoPlan("go-plus"), "go-plus");
+  assert.equal(mod.resolveGoPlan("go-teams"), "go-teams");
 });
 
-test("parseLimits returns empty object for malformed or missing table", () => {
-  assert.deepEqual(mod.parseLimits("<div>No table here</div>"), {});
-  assert.deepEqual(mod.parseLimits(""), {});
+test("parseGoModels reads per-plan limits and token prices", () => {
+  const payload = {
+    data: [
+      {
+        id: "deepseek-v4.1-flash",
+        cost: {
+          text: {
+            input: { price: 0.15, cache: { read: 0.003 } },
+            output: { price: 0.6 },
+          },
+        },
+        go: { monthly_usage: { go: 100, "go-plus": 200, "go-teams": 105 } },
+      },
+      {
+        id: "glm-5.3-flash",
+        cost: { text: { input: { price: 0.1 }, output: { price: 0.4 } } },
+        go: { monthly_usage: { go: 60, "go-teams": 90 } },
+      },
+      { id: "not-go-covered", cost: { text: { input: { price: 1 }, output: { price: 2 } } } },
+      { id: "unlimited-model", go: { monthly_usage: { go: "unlimited" } } },
+      { id: "empty-usage", go: { monthly_usage: {} } },
+      { id: 42 },
+      null,
+    ],
+  };
+
+  const go = mod.parseGoModels(payload, "go");
+  assert.equal(go.flatLimits["deepseekv4.1flash"], 100);
+  assert.equal(go.flatLimits["glm5.3flash"], 60);
+  assert.deepEqual(go.fullModels["deepseek-v4.1-flash"], {
+    limit: 100,
+    price: { input: 0.15, output: 0.6, cachedRead: 0.003 },
+  });
+
+  const teams = mod.parseGoModels(payload, "go-teams");
+  assert.equal(teams.flatLimits["deepseekv4.1flash"], 105, "go-teams differs from go");
+  assert.equal(teams.fullModels["glm-5.3-flash"].limit, 90);
+
+  // A plan missing from a model falls back to its `go` figure.
+  const plus = mod.parseGoModels(payload, "go-plus");
+  assert.equal(plus.flatLimits["deepseekv4.1flash"], 200);
+  assert.equal(plus.flatLimits["glm5.3flash"], 60, "go-plus falls back to go");
+
+  // Not Go-covered: absent from both maps, not rendered as 0.
+  assert.equal(go.flatLimits["notgocovered"], undefined);
+  assert.equal(go.fullModels["not-go-covered"], undefined);
+  assert.equal(go.fullModels["empty-usage"], undefined);
+  assert.equal(go.fullModels["unlimited-model"].limit, "unlimited", "unlimited survives as a symbolic limit");
+  assert.equal(Object.keys(go.fullModels).length, 3);
+});
+
+test("parseGoModels returns two empty objects for a malformed payload", () => {
+  for (const payload of [undefined, null, "nope", 7, {}, { data: "nope" }, { data: [] }]) {
+    assert.deepEqual(mod.parseGoModels(payload, "go"), { flatLimits: {}, fullModels: {} });
+  }
 });
 
 test("parseOpenRouterPricing parses token pricing per 1M tokens", () => {
@@ -395,54 +441,6 @@ test("formatGoDiffTable formats a table with required columns", () => {
   assert.match(table, /—\/—/);
   assert.match(table, /\|\s*\.041\/\.12\s*\|/);
   assert.match(table, /limit 15>60/);
-});
-
-test("parseGoPricing parses only first panel (Go) and ignores Go Plus", () => {
-  const html = `
-    <div>
-      <h2>Go Panel</h2>
-      <table>
-        <thead>
-          <tr><th>Model</th><th>Input</th><th>Output</th><th>Cached Read</th><th>Cached Write</th><th>Monthly limit</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>GLM-5.3-Flash</td>
-            <td>$0.15</td>
-            <td>$0.50</td>
-            <td>$0.03</td>
-            <td>-</td>
-            <td><strong>$60</strong></td>
-          </tr>
-        </tbody>
-      </table>
-      <h2>Go Plus Panel</h2>
-      <table>
-        <thead>
-          <tr><th>Model</th><th>Input</th><th>Output</th><th>Cached Read</th><th>Cached Write</th><th>Monthly limit</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>GLM-5.3-Flash</td>
-            <td>$0.15</td>
-            <td>$0.50</td>
-            <td>$0.03</td>
-            <td>-</td>
-            <td><strong>$180</strong></td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  `;
-  const { flatLimits, fullModels } = mod.parseGoPricing(html);
-  assert.equal(flatLimits["glm5.3flash"], 60, "Must parse Go limit ($60), not Go Plus ($180)");
-  assert.ok(fullModels["GLM-5.3-Flash"]);
-  assert.equal(fullModels["GLM-5.3-Flash"].limit, 60);
-  assert.deepEqual(fullModels["GLM-5.3-Flash"].price, {
-    input: 0.15,
-    output: 0.5,
-    cachedRead: 0.03,
-  });
 });
 
 test("computePriceDiff handles v1 to v2 migration with no limit changes", () => {
@@ -1005,4 +1003,30 @@ test("formatGoDiffTable includes the description line within the 118-char budget
   const line = table.split("\n").find((l) => l.includes(DESCRIPTION));
   assert.ok(line, "description line must be present as a standalone line");
   assert.ok(line.length <= 118, `description line length ${line.length} exceeds 118 characters`);
+});
+
+test("computePriceDiff re-baselines on a source or plan change", () => {
+  const prev = {
+    schemaVersion: 2,
+    date: "2026-11-24",
+    source: "https://opencode.ai/v2/docs/console/go",
+    models: { "glm5.3flash": 60 },
+  };
+  const curr = {
+    schemaVersion: 2,
+    date: "2026-11-25",
+    source: "https://opencode.ai/inference/go/v1/models",
+    models: { "glm5.3flash": 60 },
+  };
+
+  const sourceSwitch = mod.computePriceDiff(prev, curr);
+  assert.equal(sourceSwitch.hasChanges, false, "source switch is not a price change");
+  assert.match(sourceSwitch.summary, /source changed/);
+
+  const planSwitch = mod.computePriceDiff(
+    { ...prev, source: curr.source, plan: "go" },
+    { ...curr, plan: "go-plus" },
+  );
+  assert.equal(planSwitch.hasChanges, false, "plan switch is not a price change");
+  assert.match(planSwitch.summary, /plan changed/);
 });

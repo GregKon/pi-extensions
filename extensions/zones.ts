@@ -48,11 +48,12 @@
  * sorts after "caveman"/"deepseek-peak", so the colored zone lands at the RIGHT end of
  * that status line. No extra line, no footer replacement, colors via ANSI (theme.fg).
  *
- * Right of the zone, for `opencode-go` models only: the model's monthly limit from the
- * Go docs (`| $60`), then the live subscription allowance from
- * `GET https://opencode.ai/zen/go/v1/usage` (`· 5h: 2% · W: 23% · M: 49%`). The allowance
- * is refetched on session start and model change, after a turn with a 3-minute cooldown,
- * and hourly while the model stays selected; a failed read keeps the last values and marks
+ * Right of the zone, for `opencode-go` models only: the model's monthly limit from the Go
+ * models catalog (`| $60`; the plan comes from `OPENCODE_GO_PLAN`, default `go`), then the
+ * live subscription allowance from `GET https://opencode.ai/zen/go/v1/usage`
+ * (`· 5h: 2% · W: 23% · M: 49%`). The allowance is refetched on session start and model
+ * change, after a turn with a 3-minute cooldown, and hourly while the model stays selected; a
+ * failed read keeps the last values and marks
  * them with `*`, and disappears entirely on any non-go model.
  *
  * Prompt gate — only at session start (also on /resume) and when the model changes:
@@ -186,25 +187,41 @@ function computeZone(
 
 // --- opencode-go monthly limits ---
 //
-// Source of truth: https://opencode.ai/v2/docs/console/go ("Usage limits" table).
-// The old path /docs/go/ answers 404 (verified 2026-10-13) and /docs/go.md too, so
-// the v2 console page is the live one. That page renders TWO tab panels with a full
-// table each ("Go" and "Go Plus"); the parser picks the FIRST table whose headers
-// contain BOTH "model" and "limit", i.e. the Go panel, so the Plus limits
-// ($180/$240...) are deliberately ignored. A parser that scanned every row
-// would end up with Plus values.
-// Limits change day-to-day, so we fetch the docs page at most once per day and
-// cache the parsed table in os.tmpdir(). If today's fetch fails, we fall back to the
-// newest older cache and mark the number with `*`; with no cache at all the segment
-// becomes a visible `$? (why)` error for opencode-go models. Previously both cases
-// were silent, which is how a dead URL could hide the limits indefinitely.
+// Source of truth: the public models catalog GET https://opencode.ai/inference/go/v1/models
+// (no auth). It replaced the "Usage limits" table on /v2/docs/console/go, which dropped that
+// column on 2026-11-25 and moved per-plan limits behind an auth-gated console. Most catalog
+// models carry `go.monthly_usage` keyed by plan (`go`, `go-plus`, `go-teams`); the plan comes
+// from `OPENCODE_GO_PLAN` and defaults to `go`, and a plan that is missing from a model falls
+// back to its `go` figure. A model without that object is not Go-covered, so it is
+// dropped from both maps instead of showing a made-up number.
+// Limits change day-to-day, so we fetch the catalog at most once per day and
+// cache the parsed values in os.tmpdir(). If today's fetch fails, we fall back to the
+// newest older cache and mark the number with `*` — except a cache written under another
+// plan, which is skipped so a plan switch never shows the wrong column; with no usable
+// cache at all the segment becomes a visible `$? (why)` error for opencode-go models.
+// Previously both cases were silent, which is how a dead URL could hide the limits indefinitely.
 
-const GO_DOCS_URL = "https://opencode.ai/v2/docs/console/go";
+const GO_MODELS_URL = "https://opencode.ai/inference/go/v1/models";
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const GO_CACHE_PREFIX = "opencode-go-prices-";
 const GO_DIFF_PREFIX = "opencode-go-diff-";
 
 export type GoLimit = number | "unlimited";
+
+/** OpenCode Go subscription plan whose monthly limits the footer shows. */
+export type GoPlan = "go" | "go-plus" | "go-teams";
+
+const GO_PLANS: readonly GoPlan[] = ["go", "go-plus", "go-teams"];
+
+/**
+ * Plan the footer reads limits for: `OPENCODE_GO_PLAN`, default `go`. An unknown or empty
+ * value falls back to `go` instead of failing — a typo in the environment must not blank the
+ * limit segment.
+ */
+export function resolveGoPlan(raw: string | undefined = process.env.OPENCODE_GO_PLAN): GoPlan {
+  const value = (raw ?? "").trim().toLowerCase() as GoPlan;
+  return GO_PLANS.includes(value) ? value : "go";
+}
 
 export interface GoTokenPrice {
   input: number; // USD per 1M tokens (0 for Free)
@@ -227,6 +244,8 @@ export interface CachedPrices {
   schemaVersion?: number; // 2 for new format with token prices
   date: string;
   source?: string;
+  /** Plan the limits were read for (`OPENCODE_GO_PLAN`); a mismatch must not be reused. */
+  plan?: GoPlan;
   models?: Record<string, GoLimit>; // flat fast lookup for footer limit: normId -> limit
   opencode?: {
     models: Record<string, GoModelEntry | GoLimit>; // union for backward compatibility
@@ -300,6 +319,11 @@ function loadCache(): { models: Record<string, GoLimit>; stale: boolean; raw?: C
     for (const p of paths) {
       if (!existsSync(p)) continue;
       const json = JSON.parse(readFileSync(p, "utf8")) as CachedPrices;
+      // A cache written under another plan holds the wrong monthly limits: skip it so the caller
+      // refetches, instead of showing a different plan's numbers for the rest of the day. Caches
+      // from before plans existed carry no `plan`; theirs is the docs table's `go` column.
+      const cachedPlan = json.plan ?? "go";
+      if (cachedPlan !== resolveGoPlan()) continue;
       let flatLimits: Record<string, GoLimit> = json.models || {};
       if (Object.keys(flatLimits).length === 0 && json.opencode?.models) {
         flatLimits = Object.fromEntries(
@@ -366,137 +390,74 @@ function normId(name: string): string {
   return s;
 }
 
-function parsePriceValue(cell: string): number | undefined {
-  if (!cell) return undefined;
-  const strongUsd = cell.match(/<strong>\s*\$([\d.]+)/);
-  if (strongUsd) return parseFloat(strongUsd[1]);
-  const normalUsd = cell.match(/\$([\d.]+)/);
-  if (normalUsd) return parseFloat(normalUsd[1]);
-  const text = cell.replace(/<[^>]+>/g, "").trim();
-  if (/^free$/i.test(text) || /free/i.test(cell)) return 0;
-  return undefined;
-}
-
-function parseLimitValue(cell: string): GoLimit | undefined {
-  if (!cell) return undefined;
-  const strongUsd = cell.match(/<strong>\s*\$([\d.]+)/);
-  if (strongUsd) return parseFloat(strongUsd[1]);
-  if (/<strong>\s*unlimited/i.test(cell)) return "unlimited";
-  const normalUsd = cell.match(/\$([\d.]+)/);
-  if (normalUsd) return parseFloat(normalUsd[1]);
-  if (/unlimited/i.test(cell)) return "unlimited";
-  if (/free/i.test(cell)) return 0;
-  return undefined;
+/** Accept only numbers the catalog can mean by a price/limit, never NaN or Infinity. */
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 /**
- * Parse Go pricing table from docs HTML, isolating the first panel ("Go" panel)
- * and ignoring subsequent panels like "Go Plus".
+ * Monthly limit from a catalog `go.monthly_usage` object: the value for `plan`, falling back to
+ * `go` when the plan is absent. `undefined` means the model is not covered by the plan.
  */
-export function parseGoPricing(html: string): {
+function monthlyLimit(usage: unknown, plan: GoPlan): GoLimit | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const byPlan = usage as Record<string, unknown>;
+  const raw = byPlan[plan] ?? byPlan.go;
+  if (raw === "unlimited") return "unlimited";
+  return finiteNumber(raw);
+}
+
+/** Token price per 1M tokens from a catalog `cost.text` block; undefined without in and out. */
+function tokenPrice(cost: unknown): GoTokenPrice | undefined {
+  if (!cost || typeof cost !== "object") return undefined;
+  const text = (cost as { text?: unknown }).text;
+  if (!text || typeof text !== "object") return undefined;
+  const sides = text as { input?: unknown; output?: unknown };
+  const input = sides.input as { price?: unknown; cache?: { read?: unknown } } | undefined;
+  const output = sides.output as { price?: unknown } | undefined;
+  const inputPrice = finiteNumber(input?.price);
+  const outputPrice = finiteNumber(output?.price);
+  if (inputPrice === undefined && outputPrice === undefined) return undefined;
+  const price: GoTokenPrice = { input: inputPrice ?? 0, output: outputPrice ?? 0 };
+  const cachedRead = finiteNumber(input?.cache?.read);
+  if (cachedRead !== undefined) price.cachedRead = cachedRead;
+  return price;
+}
+
+/**
+ * Parse the Go models catalog (`GET /inference/go/v1/models`) into the flat footer lookup and
+ * the full entry map used by the cache/diff. A model without a monthly limit for `plan` is not
+ * covered by that plan and is skipped in BOTH maps; malformed entries are ignored, never fatal.
+ */
+export function parseGoModels(
+  payload: unknown,
+  plan: GoPlan,
+): {
   flatLimits: Record<string, GoLimit>;
   fullModels: Record<string, GoModelEntry>;
 } {
   const flatLimits: Record<string, GoLimit> = {};
   const fullModels: Record<string, GoModelEntry> = {};
 
-  if (!html) return { flatLimits, fullModels };
+  if (!payload || typeof payload !== "object") return { flatLimits, fullModels };
+  const list = (payload as { data?: unknown }).data;
+  if (!Array.isArray(list)) return { flatLimits, fullModels };
 
-  const tableMatches = html.match(/<table[\s\S]*?<\/table>/gi);
-  if (!tableMatches) return { flatLimits, fullModels };
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const id = (item as { id?: unknown }).id;
+    if (typeof id !== "string" || !id) continue;
 
-  let targetTable: string | null = null;
-  let targetCleanTh: string[] = [];
-
-  for (const tableHtml of tableMatches) {
-    const thMatches = [...tableHtml.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi)].map((m) => m[1]);
-    const cleanTh = thMatches.map((th) =>
-      th.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().toLowerCase(),
-    );
-    const hasModel = cleanTh.some((h) => h.includes("model"));
-    const hasLimit = cleanTh.some((h) => h.includes("limit"));
-    if (hasModel && hasLimit) {
-      targetTable = tableHtml;
-      targetCleanTh = cleanTh;
-      break;
-    }
-  }
-
-  if (!targetTable) return { flatLimits, fullModels };
-
-  let modelIdx = -1;
-  let inputIdx = -1;
-  let outputIdx = -1;
-  let cachedReadIdx = -1;
-  let cachedWriteIdx = -1;
-  let limitIdx = -1;
-
-  for (let i = 0; i < targetCleanTh.length; i++) {
-    const h = targetCleanTh[i];
-    if (h.includes("cached read")) {
-      cachedReadIdx = i;
-    } else if (h.includes("cached write")) {
-      cachedWriteIdx = i;
-    } else if (h.includes("input")) {
-      inputIdx = i;
-    } else if (h.includes("output")) {
-      outputIdx = i;
-    } else if (h.includes("limit")) {
-      limitIdx = i;
-    } else if (h.includes("model")) {
-      modelIdx = i;
-    }
-  }
-
-  if (modelIdx === -1) modelIdx = 0;
-
-  const rowMatches = targetTable.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
-  for (const row of rowMatches) {
-    const cells = [...row[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => m[1]);
-    if (cells.length < 2) continue;
-
-    const nameCell = cells[modelIdx] ?? cells[0] ?? "";
-    const name = nameCell.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-    if (!name) continue;
-
-    const limitCell =
-      limitIdx !== -1 && cells[limitIdx] !== undefined
-        ? cells[limitIdx]
-        : cells[cells.length - 1];
-    const limit = parseLimitValue(limitCell);
+    const usage = (item as { go?: { monthly_usage?: unknown } }).go?.monthly_usage;
+    const limit = monthlyLimit(usage, plan);
     if (limit === undefined) continue;
 
-    let price: GoTokenPrice | undefined;
-    if (inputIdx !== -1 && outputIdx !== -1) {
-      const inVal = parsePriceValue(cells[inputIdx] ?? "");
-      const outVal = parsePriceValue(cells[outputIdx] ?? "");
-      if (inVal !== undefined && outVal !== undefined) {
-        price = { input: inVal, output: outVal };
-        if (cachedReadIdx !== -1) {
-          const crVal = parsePriceValue(cells[cachedReadIdx] ?? "");
-          if (crVal !== undefined) price.cachedRead = crVal;
-        }
-        if (cachedWriteIdx !== -1) {
-          const cwVal = parsePriceValue(cells[cachedWriteIdx] ?? "");
-          if (cwVal !== undefined) price.cachedWrite = cwVal;
-        }
-      }
-    }
-
-    const entry: GoModelEntry = { limit, price };
-    fullModels[name] = entry;
-    flatLimits[normId(name)] = limit;
+    const price = tokenPrice((item as { cost?: unknown }).cost);
+    fullModels[id] = price ? { limit, price } : { limit };
+    flatLimits[normId(id)] = limit;
   }
 
   return { flatLimits, fullModels };
-}
-
-/**
- * Parse the "Usage limits" table out of the docs HTML.
- * Kept 100% backward-compatible: returns flat map normId(name) -> limit.
- */
-export function parseLimits(html: string): Record<string, GoLimit> {
-  return parseGoPricing(html).flatLimits;
 }
 
 /**
@@ -544,6 +505,18 @@ export function computePriceDiff(
 
   if (!prev) {
     diff.summary = "OpenCode Go & OpenRouter: initial data loaded, no previous cache to compare.";
+    return diff;
+  }
+
+  // A cache written by another source (the removed docs table), another catalog layout or another
+  // plan would otherwise show up as a bulk add/remove on the first run after the switch. Treat it
+  // as a new baseline instead of notifying about a change that only reflects the switch.
+  const sourceChanged = prev.source && curr.source && prev.source !== curr.source;
+  const planChanged = prev.plan && curr.plan && prev.plan !== curr.plan;
+  if (sourceChanged || planChanged) {
+    diff.summary = planChanged
+      ? "OpenCode Go plan changed; baseline re-established."
+      : "OpenCode Go source changed; baseline re-established.";
     return diff;
   }
 
@@ -1008,7 +981,7 @@ function formatGoUsage(
   window("M", usage.monthly);
   if (parts.length === 0) return "";
   const mark = stale ? "*" : "";
-  // "||" separates the docs limit from the live allowance; "·" stays inside the allowance.
+  // "||" separates the monthly limit from the live allowance; "·" stays inside the allowance.
   return bold(` || ${parts.join(" · ")}${mark}`);
 }
 
@@ -1029,8 +1002,8 @@ function limitLabel(
 
 /**
  * Visible failure for an opencode-go model with no limit data. `why` names the cause
- * (`no data` = nothing fetched yet, `fetch failed` = offline/404/layout change,
- * `model not in docs` = docs have no row for this id) so the segment is actionable
+ * (`no data` = nothing fetched yet, `fetch failed` = offline/404/catalog change,
+ * `model not in catalog` = the catalog has no entry for this id) so the segment is actionable
  * instead of a silently missing number.
  */
 function limitErrorLabel(
@@ -1302,14 +1275,14 @@ export default function (pi: ExtensionAPI) {
     const goTimer = setTimeout(() => goController.abort(), 15000);
 
     try {
-      const [html, orPricing] = await Promise.all([
-        fetch(GO_DOCS_URL, { signal: goController.signal })
-          .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      const [payload, orPricing] = await Promise.all([
+        fetch(GO_MODELS_URL, { signal: goController.signal })
+          .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
           .finally(() => clearTimeout(goTimer)),
         fetchOpenRouterPricing(),
       ]);
 
-      const { flatLimits, fullModels } = parseGoPricing(html);
+      const { flatLimits, fullModels } = parseGoModels(payload, resolveGoPlan());
       if (Object.keys(fullModels).length > 0) {
         goPrices = flatLimits;
         goStale = false;
@@ -1319,7 +1292,8 @@ export default function (pi: ExtensionAPI) {
         const todayData: CachedPrices = {
           schemaVersion: 2,
           date: dayStamp(),
-          source: GO_DOCS_URL,
+          source: GO_MODELS_URL,
+          plan: resolveGoPlan(),
           models: flatLimits,
           opencode: { models: fullModels },
           openrouter: { models: orPricing },
@@ -1353,7 +1327,7 @@ export default function (pi: ExtensionAPI) {
         if (lastCtx) updateStatus(lastCtx);
       }
     } catch {
-      // offline / 404 / layout change — keep whatever older cache was loaded, mark it
+      // offline / 404 / catalog change — keep whatever older cache was loaded, mark it
       // stale and surface the failure in the status line instead of hiding the segment.
       goFetchFailed = true;
       if (lastCtx) updateStatus(lastCtx);
@@ -1433,7 +1407,7 @@ export default function (pi: ExtensionAPI) {
       status += limitLabel(limit, boldLabel, fgLabel, goStale || goFetchFailed);
     } else if (isGoModel(model.provider)) {
       status += limitErrorLabel(
-        goFetchFailed ? "fetch failed" : goPrices ? "model not in docs" : "no data",
+        goFetchFailed ? "fetch failed" : goPrices ? "model not in catalog" : "no data",
         boldLabel,
         fgLabel,
       );
